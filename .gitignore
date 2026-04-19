@@ -1,0 +1,7 @@
+StarCraftII/
+.vscode/
+__pycache__/
+.ruff_cache/
+datasets/
+checkpoints/
+runs/
