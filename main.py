@@ -3,7 +3,7 @@ from sc2.main import run_game
 from sc2.data import Difficulty
 from sc2.data import Race
 from sc2.player import Bot, Computer
-from winning_bot import WinningZergBot
+from zerg_bots import CheeseZergBot
 from staragent import StarAgent
 
 MAP = "AbyssalReefAIE"
@@ -12,15 +12,12 @@ difficulty = Difficulty.VeryEasy
 RENDER = True
 LOG = True
 
-star_bot = Bot(Race.Zerg, StarAgent(train_mode=True, checkpoint_path="checkpoints/bc_agent.pt"))
+star_bot = Bot(
+    Race.Zerg, StarAgent(train_mode=True, checkpoint_path="checkpoints/Alexander_best.pt")
+)
 winner_bot = Bot(
     Race.Zerg,
-    WinningZergBot(
-        max_drones=16,
-        attack_threshold=7,
-        action_interval=4,
-        collect_data=False,
-    ),
+    CheeseZergBot(4)
 )
 
 if not LOG:
@@ -33,11 +30,13 @@ for episode in range(1, EPISODES + 1):
     print(f"\n=== Episode {episode}/{EPISODES} ===")
     result = run_game(
         sc2.maps.get(MAP),
-        [star_bot, computer_bot],
-        realtime=False,
+        [star_bot, winner_bot, computer_bot],
+        realtime=True,
         rgb_render_config={
-    "window_size": (1024, 720),
-    "minimap_size": (200, 200),
-} if RENDER else None,
+            "window_size": (1024, 720),
+            "minimap_size": (200, 200),
+        }
+        if RENDER
+        else None,
     )
     print(f"Episode result: {result}")

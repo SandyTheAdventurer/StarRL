@@ -1,5 +1,7 @@
 from sc2.bot_ai import BotAI
 from sc2.ids.unit_typeid import UnitTypeId
+from sc2.ids.ability_id import AbilityId
+from sc2.ids.upgrade_id import UpgradeId
 from sc2.position import Point2
 import numpy as np
 import torch
@@ -14,7 +16,37 @@ class Scaffold(BotAI):
     ):
         super().__init__()
         self.observation_space = ((12, 64, 64), 7)
-        self.total_actions = 13
+        # 0: no-op
+        # 1: build spawning pool
+        # 2: train zerglings
+        # 3: attack
+        # 4: train drones
+        # 5: train overlord
+        # 6: train anti-air (hydralisk)
+        # 7: train flying (mutalisk)
+        # 8: build hydralisk den
+        # 9: build spire
+        # 10: build roach warren
+        # 11: train roach
+        # 12: build baneling nest
+        # 13: train baneling
+        # 14: build infestation pit
+        # 15: build greater spire
+        # 16: train brood lord
+        # 17: build spine crawler
+        # 18: build spore crawler
+        # 19: inject larva
+        # 20: spread creep
+        # 21: transfuse
+        # 22: research zergling speed
+        # 23: research burrow
+        # 24: research roach speed
+        # 25: research baneling speed
+        # 26: research flyer attacks
+        # 27: retreat
+        # 28: regroup
+        # 29: focus fire
+        self.total_actions = 30
 
         self._reward_weights = reward_weights or {
             "minerals": 1 / 2000.0,
@@ -183,6 +215,42 @@ class Scaffold(BotAI):
         await self.expand_now()
         return True
 
+    async def build_hydralisk_den(self):
+        if self.can_afford(UnitTypeId.HYDRALISKDEN) and self.structures(UnitTypeId.LAIR).ready:
+            lair = self.structures(UnitTypeId.LAIR).ready.first
+            pos = lair.position.towards(self.game_info.map_center, 5)
+            await self.build(UnitTypeId.HYDRALISKDEN, near=pos)
+            return True
+        return False
+
+    async def build_spire(self):
+        if self.can_afford(UnitTypeId.SPIRE) and self.structures(UnitTypeId.LAIR).ready:
+            lair = self.structures(UnitTypeId.LAIR).ready.first
+            pos = lair.position.towards(self.game_info.map_center, 5)
+            await self.build(UnitTypeId.SPIRE, near=pos)
+            return True
+        return False
+
+    async def train_anti_air(self, n=1):
+        # Example: Hydralisk (anti-air ground unit)
+        if self.can_afford(UnitTypeId.HYDRALISK) and self.structures(UnitTypeId.HYDRALISKDEN).ready:
+            for _ in range(n):
+                larva = self.units(UnitTypeId.LARVA).filter(lambda l: l.tag not in self.unit_tags_received_action).first
+                if larva:
+                    self.do(larva.train(UnitTypeId.HYDRALISK))
+            return True
+        return False
+
+    async def train_flying_unit(self, n=1):
+        # Example: Mutalisk (flying unit)
+        if self.can_afford(UnitTypeId.MUTALISK) and self.structures(UnitTypeId.SPIRE).ready:
+            for _ in range(n):
+                larva = self.units(UnitTypeId.LARVA).filter(lambda l: l.tag not in self.unit_tags_received_action).first
+                if larva:
+                    self.do(larva.train(UnitTypeId.MUTALISK))
+            return True
+        return False
+    
     async def train_drones(self, n: int = 1) -> bool:
         issued = False
         for _ in range(max(1, n)):
@@ -504,3 +572,177 @@ class Scaffold(BotAI):
             if unit.is_idle or unit.distance_to(rally) > 12:
                 self.do(unit.move(rally))
         return True
+
+    async def train_roach(self, n: int = 2) -> bool:
+        if not self.structures(UnitTypeId.ROACHWARREN).ready:
+            return False
+
+        issued = False
+        for _ in range(max(1, n)):
+            if (
+                self.larva
+                and self.can_afford(UnitTypeId.ROACH)
+                and self.supply_left >= 2
+            ):
+                larva = self.larva.random
+                self.do(larva.train(UnitTypeId.ROACH))
+                issued = True
+        return issued
+
+    async def build_roach_warren(self) -> bool:
+        if self.structures(UnitTypeId.ROACHWARREN):
+            return False
+        if not self.structures(UnitTypeId.HATCHERY).ready:
+            return False
+        if not self.can_afford(UnitTypeId.ROACHWARREN):
+            return False
+        near = self.start_location.towards(self.game_info.map_center, 6)
+        return await self.build(UnitTypeId.ROACHWARREN, near=near)
+
+    async def build_baneling_nest(self) -> bool:
+        if self.structures(UnitTypeId.BANELINGNEST):
+            return False
+        if not self.structures(UnitTypeId.SPAWNINGPOOL).ready:
+            return False
+        if not self.can_afford(UnitTypeId.BANELINGNEST):
+            return False
+        near = self.start_location.towards(self.game_info.map_center, 6)
+        return await self.build(UnitTypeId.BANELINGNEST, near=near)
+
+    async def build_infestation_pit(self) -> bool:
+        if self.structures(UnitTypeId.INFESTATIONPIT):
+            return False
+        if not self.structures(UnitTypeId.LAIR).ready:
+            return False
+        if not self.can_afford(UnitTypeId.INFESTATIONPIT):
+            return False
+        lair = self.structures(UnitTypeId.LAIR).ready.first
+        pos = lair.position.towards(self.game_info.map_center, 5)
+        return await self.build(UnitTypeId.INFESTATIONPIT, near=pos)
+
+    async def build_greater_spire(self) -> bool:
+        if self.structures(UnitTypeId.GREATERSPIRE):
+            return False
+        if not self.structures(UnitTypeId.SPIRE).ready:
+            return False
+        if not self.can_afford(UnitTypeId.GREATERSPIRE):
+            return False
+        spire = self.structures(UnitTypeId.SPIRE).ready.first
+        pos = spire.position.towards(self.game_info.map_center, 5)
+        return await self.build(UnitTypeId.GREATERSPIRE, near=pos)
+
+    async def train_brood_lord(self, n: int = 1) -> bool:
+        if not self.structures(UnitTypeId.GREATERSPIRE).ready:
+            return False
+        corruptors = self.units(UnitTypeId.CORRUPTOR).ready
+        if not corruptors:
+            return False
+        issued = False
+        for _ in range(max(1, n)):
+            if not self.can_afford(UnitTypeId.BROODLORD):
+                break
+            corruptors = self.units(UnitTypeId.CORRUPTOR).ready
+            if not corruptors:
+                break
+            corruptor = corruptors.random
+            self.do(corruptor.train(UnitTypeId.BROODLORD))
+            issued = True
+        return issued
+
+    async def build_spine_crawler(self) -> bool:
+        if not self.can_afford(UnitTypeId.SPINECRAWLER):
+            return False
+        if not self.structures(UnitTypeId.HATCHERY).ready:
+            return False
+        hatch = self.structures(UnitTypeId.HATCHERY).ready.first
+        pos = hatch.position.towards(self.game_info.map_center, 7)
+        return await self.build(UnitTypeId.SPINECRAWLER, near=pos)
+
+    async def build_spore_crawler(self) -> bool:
+        if not self.can_afford(UnitTypeId.SPORECRAWLER):
+            return False
+        if not self.structures(UnitTypeId.HATCHERY).ready:
+            return False
+        hatch = self.structures(UnitTypeId.HATCHERY).ready.first
+        pos = hatch.position.towards(self.game_info.map_center, 7)
+        return await self.build(UnitTypeId.SPORECRAWLER, near=pos)
+
+    async def inject_larva(self) -> bool:
+        if self.units(UnitTypeId.QUEEN).ready and self.townhalls.ready:
+            queen = self.units(UnitTypeId.QUEEN).ready.first
+            hatch = self.townhalls.ready.first
+            self.do(queen(AbilityId.EFFECT_INJECTLARVA, hatch))
+            return True
+        return False
+
+    async def spread_creep(self) -> bool:
+        if self.units(UnitTypeId.QUEEN).ready:
+            queen = self.units(UnitTypeId.QUEEN).ready.first
+            target_pos = queen.position.towards(self.game_info.map_center, 10)
+            self.do(queen(AbilityId.BUILD_CREEPTUMOR_QUEEN, target_pos))
+            return True
+        return False
+
+    async def transfuse(self) -> bool:
+        if self.units(UnitTypeId.QUEEN).ready:
+            queen = self.units(UnitTypeId.QUEEN).ready.first
+            injured = self.units.filter(lambda u: u.health < u.health_max)
+            if injured:
+                self.do(queen(AbilityId.TRANSFUSION_TRANSFUSION, injured.first))
+                return True
+        return False
+
+    async def research_zergling_speed(self) -> bool:
+        if self.structures(UnitTypeId.SPAWNINGPOOL).ready:
+            pool = self.structures(UnitTypeId.SPAWNINGPOOL).ready.first
+            self.do(pool.research(UpgradeId.ZERGLINGMOVEMENTSPEED))
+            return True
+        return False
+
+    async def research_burrow(self) -> bool:
+        if self.structures(UnitTypeId.HATCHERY).ready:
+            hatch = self.structures(UnitTypeId.HATCHERY).ready.first
+            self.do(hatch.research(UpgradeId.BURROW))
+            return True
+        return False
+
+    async def research_roach_speed(self) -> bool:
+        if self.structures(UnitTypeId.ROACHWARREN).ready:
+            warren = self.structures(UnitTypeId.ROACHWARREN).ready.first
+            self.do(warren.research(UpgradeId.GLIALRECONSTITUTION))
+            return True
+        return False
+
+    async def research_baneling_speed(self) -> bool:
+        if self.structures(UnitTypeId.BANELINGNEST).ready:
+            nest = self.structures(UnitTypeId.BANELINGNEST).ready.first
+            self.do(nest.research(UpgradeId.CENTRIFICALHOOKS))
+            return True
+        return False
+
+    async def research_flyer_attacks(self) -> bool:
+        if self.structures(UnitTypeId.SPIRE).ready:
+            spire = self.structures(UnitTypeId.SPIRE).ready.first
+            id = UpgradeId.ZERGFLYERWEAPONSLEVEL1
+            self.do(spire.research(id))
+            return True
+        return False
+
+    async def retreat(self) -> bool:
+        for unit in self.units.idle:
+            self.do(unit.move(self.start_location))
+        return True
+
+    async def regroup(self) -> bool:
+        rally = self.start_location.towards(self.game_info.map_center, 8)
+        for unit in self.units.idle:
+            self.do(unit.move(rally))
+        return True
+
+    async def focus_fire(self) -> bool:
+        if self.enemy_units:
+            target = self.enemy_units.closest_to(self.start_location)
+            for unit in self.units.idle:
+                self.do(unit.attack(target))
+            return True
+        return False

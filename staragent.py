@@ -35,6 +35,7 @@ class StarAgent(Scaffold):
         self.device = self._resolve_device(device)
         self.hidden_dim = int(hidden_dim)
         self.n_lstm_layers = max(1, int(n_lstm_layers))
+        self.total_actions = 30
 
         image_channels = self.observation_space[0][0]
         self.feature_extractor = ImageFeatureExtractor(
@@ -88,6 +89,70 @@ class StarAgent(Scaffold):
 
         print(f"[StarAgent] Using device: {self.device}")
         self._load_checkpoint()
+
+    async def _execute_action(self, action_idx: int):
+        # See Scaffold for action mapping
+        if action_idx == 0:
+            return False
+        if action_idx == 1:
+            return await self.build_spawning_pool()
+        if action_idx == 2:
+            return await self.train_zerglings(6)
+        if action_idx == 3:
+            return await self.attack_move(target=self._get_attack_target())
+        if action_idx == 4:
+            return await self.train_drones(1)
+        if action_idx == 5:
+            return await self.train_overlord(1)
+        if action_idx == 6:
+            return await self.train_anti_air(2)
+        if action_idx == 7:
+            return await self.train_flying_unit(2)
+        if action_idx == 8:
+            return await self.build_hydralisk_den()
+        if action_idx == 9:
+            return await self.build_spire()
+        if action_idx == 10:
+            return await self.build_roach_warren()
+        if action_idx == 11:
+            return await self.train_roach(2)
+        if action_idx == 12:
+            return await self.build_baneling_nest()
+        if action_idx == 13:
+            return await self.train_baneling(2)
+        if action_idx == 14:
+            return await self.build_infestation_pit()
+        if action_idx == 15:
+            return await self.build_greater_spire()
+        if action_idx == 16:
+            return await self.train_brood_lord(1)
+        if action_idx == 17:
+            return await self.build_spine_crawler()
+        if action_idx == 18:
+            return await self.build_spore_crawler()
+        if action_idx == 19:
+            return await self.inject_larva()
+        if action_idx == 20:
+            return await self.spread_creep()
+        if action_idx == 21:
+            return await self.transfuse()
+        if action_idx == 22:
+            return await self.research_zergling_speed()
+        if action_idx == 23:
+            return await self.research_burrow()
+        if action_idx == 24:
+            return await self.research_roach_speed()
+        if action_idx == 25:
+            return await self.research_baneling_speed()
+        if action_idx == 26:
+            return await self.research_flyer_attacks()
+        if action_idx == 27:
+            return await self.retreat()
+        if action_idx == 28:
+            return await self.regroup()
+        if action_idx == 29:
+            return await self.focus_fire()
+        return False
 
     @staticmethod
     def _resolve_device(device: str | torch.device | None) -> torch.device:
@@ -149,9 +214,11 @@ class StarAgent(Scaffold):
         except Exception as exc:
             print(f"[StarAgent] Failed to load checkpoint ({exc}); starting fresh")
 
-    def _save_checkpoint(self, path=None):
+    def save_checkpoint(self, path=None):
         if path is None:
             path = self.checkpoint_path
+        if type(path) == str:
+            path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         state = {
             "feature_extractor": self.feature_extractor.state_dict(),
@@ -344,9 +411,6 @@ class StarAgent(Scaffold):
 
         if self.episode_rewards:
             self._finish_episode(terminal_reward=terminal_reward)
-
-        if self.train_mode:
-            self._save_checkpoint()
 
         metrics = self._collect_metrics()
         self._log_episode_end(result, metrics)
