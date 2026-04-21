@@ -1,7 +1,9 @@
 StarCraftII/
 .vscode/
+.venv
 __pycache__/
 .ruff_cache/
 datasets/
 checkpoints/
 runs/
+mlflow.db
