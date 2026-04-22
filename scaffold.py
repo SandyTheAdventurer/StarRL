@@ -15,7 +15,7 @@ class Scaffold(BotAI):
         log_level: int = 0,
     ):
         super().__init__()
-        self.observation_space = ((12, 64, 64), 7)
+        self.observation_space = ((12, 64, 64), 8)
         # 0: no-op
         # 1: build spawning pool
         # 2: train zerglings
@@ -58,27 +58,36 @@ class Scaffold(BotAI):
         # 39: maintain worker economy
         # 40: ensure overlord buffer
         # 41: flood zerglings
-        self.total_actions = 43
+        # 42: train queen
+        # 43: train ultralisk
+        # 44: train infestor
+        # 45: train lurker
+        # 46: build evolution chamber
+        # 47: build ultralisk cavern
+        # 48: build nydus canal
+        # 49: build lurker den
+        # 50: research ground armor
+        # 51: research air armor
+        # 52: research neural parasite
+        # 53: build infestation pit
+        # 54: build baneling nest
+        # 55: build greater spire
+        # 56: train brood lord
+        self.total_actions = 57
 
         self._reward_weights = reward_weights or {
-            "minerals": 0.05,
-            "gas": 0.05,
-            "workers": 0.075,
-            "army": 0.01,
-            "kills": 0.015,
-            "losses": -0.01,
-            "worker_loss": -0.01,
-            "success": 0.01,
-            "supply_penalty": -0.02,
-            "mineral_rate": 0.02,
-            "gas_rate": 0.02,
-            "enemy_structure_damage": 0.001,
+            "workers": 0.002,
+            "army": 0.002,
+            "losses": -0.002,
+            "worker_loss": -0.001,
+            "success": 0.001,
+            "supply_penalty": -0.001,
+            "enemy_unit_kills": 0.005,
             "enemy_structure_destroyed": 0.01,
-            "unit_preservation": 0.02,
-            "expansion": 0.01,
+            "expansion": 0.005,
         }
         self._log_level = log_level
-        self.army_units = [UnitTypeId.ZERGLING, UnitTypeId.BANELING, UnitTypeId.HYDRALISK, UnitTypeId.MUTALISK, UnitTypeId.ROACH, UnitTypeId.CORRUPTOR, UnitTypeId.BROODLORD]
+        self.army_units = [UnitTypeId.ZERGLING, UnitTypeId.BANELING, UnitTypeId.HYDRALISK, UnitTypeId.MUTALISK, UnitTypeId.ROACH, UnitTypeId.CORRUPTOR, UnitTypeId.BROODLORD, UnitTypeId.ULTRALISK, UnitTypeId.INFESTOR, UnitTypeId.LURKERMP]
         self._prev_metrics = None
 
     def get_observation(self):
@@ -121,7 +130,7 @@ class Scaffold(BotAI):
         supply_used = self.supply_used / 200.0
         supply_cap = self.supply_cap / 200.0
         game_time = min(self.time / 1800.0, 1.0)
-        worker_count = self.units(UnitTypeId.DRONE).amount / 100.0
+        worker_count = self.units(UnitTypeId.DRONE).amount / 50.0
         army_count = (
             max(
                 self.units.not_flying.amount - self.units(UnitTypeId.DRONE).amount,
@@ -129,6 +138,7 @@ class Scaffold(BotAI):
             )
             / 100.0
         )
+        drone_supply = (self.units(UnitTypeId.DRONE).amount * 1) / 200.0
         resources = np.array(
             [
                 gas_available,
@@ -138,6 +148,7 @@ class Scaffold(BotAI):
                 game_time,
                 worker_count,
                 army_count,
+                drone_supply,
             ],
             dtype=np.float32,
         )
@@ -241,11 +252,11 @@ class Scaffold(BotAI):
         if action_idx == 1:
             return await self.build_spawning_pool()
         if action_idx == 2:
-            return await self.train_zerglings(6)
+            return await self.train_zerglings(3)
         if action_idx == 3:
             return await self.attack_move()
         if action_idx == 4:
-            return await self.train_drones(1)
+            return await self.train_drones(2)
         if action_idx == 5:
             return await self.train_overlord(1)
         if action_idx == 6:
@@ -320,6 +331,36 @@ class Scaffold(BotAI):
             return await self.ensure_overlord_buffer()
         if action_idx == 41:
             return await self.flood_zerglings()
+        if action_idx == 42:
+            return await self.train_queen(1)
+        if action_idx == 43:
+            return await self.train_ultralisk(1)
+        if action_idx == 44:
+            return await self.train_infestor(1)
+        if action_idx == 45:
+            return await self.train_lurker(1)
+        if action_idx == 46:
+            return await self.build_evolution_chamber()
+        if action_idx == 47:
+            return await self.build_ultralisk_cavern()
+        if action_idx == 48:
+            return await self.build_nydus_canal()
+        if action_idx == 49:
+            return await self.build_lurker_den()
+        if action_idx == 50:
+            return await self.research_ground_armor()
+        if action_idx == 51:
+            return await self.research_air_armor()
+        if action_idx == 52:
+            return await self.research_neural_parasite()
+        if action_idx == 53:
+            return await self.build_infestation_pit()
+        if action_idx == 54:
+            return await self.build_baneling_nest()
+        if action_idx == 55:
+            return await self.build_greater_spire()
+        if action_idx == 56:
+            return await self.train_brood_lord(1)
         return False
 
     async def build_hydralisk_den(self):
@@ -428,36 +469,104 @@ class Scaffold(BotAI):
                 issued = True
         return issued
 
+    async def train_queen(self, n: int = 1) -> bool:
+        if not self.structures(UnitTypeId.SPAWNINGPOOL).ready:
+            return False
+
+        issued = False
+        for _ in range(max(1, n)):
+            if not self.can_afford(UnitTypeId.QUEEN):
+                break
+            available_larva = self.larva.filter(lambda l: l.tag not in self.unit_tags_received_action)
+            if not available_larva:
+                break
+            larva = available_larva.random
+            self.do(larva.train(UnitTypeId.QUEEN))
+            issued = True
+        return issued
+
+    async def train_ultralisk(self, n: int = 1) -> bool:
+        if not self.structures(UnitTypeId.ULTRALISKCAVERN).ready:
+            return False
+
+        issued = False
+        for _ in range(max(1, n)):
+            if (
+                self.larva
+                and self.can_afford(UnitTypeId.ULTRALISK)
+                and self.supply_left >= 6
+            ):
+                if not self.larva:
+                    break
+                larva = self.larva.random
+                self.do(larva.train(UnitTypeId.ULTRALISK))
+                issued = True
+        return issued
+
+    async def train_infestor(self, n: int = 1) -> bool:
+        if not self.structures(UnitTypeId.INFESTATIONPIT).ready:
+            return False
+
+        issued = False
+        for _ in range(max(1, n)):
+            if (
+                self.larva
+                and self.can_afford(UnitTypeId.INFESTOR)
+                and self.supply_left >= 2
+            ):
+                if not self.larva:
+                    break
+                larva = self.larva.random
+                self.do(larva.train(UnitTypeId.INFESTOR))
+                issued = True
+        return issued
+
+    async def train_lurker(self, n: int = 1) -> bool:
+        if not self.structures(UnitTypeId.LURKERDENMP).ready:
+            return False
+
+        hydralisks = self.units(UnitTypeId.HYDRALISK).ready
+        if not hydralisks:
+            return False
+
+        issued = False
+        for _ in range(max(1, n)):
+            if not self.can_afford(UnitTypeId.LURKERMP):
+                break
+            hydralisks = self.units(UnitTypeId.HYDRALISK).ready
+            if not hydralisks:
+                break
+            hydra = hydralisks.random
+            self.do(hydra.train(UnitTypeId.LURKERMP))
+            issued = True
+        return issued
+
     def _collect_metrics(self) -> dict:
         score = self.state.score
-        # Track total minerals/gas gathered for rate calculation
-        minerals_collected = float(getattr(score, "collected_minerals", getattr(score, "total_collected_minerals", 0.0)))
-        gas_collected = float(getattr(score, "collected_vespene", getattr(score, "total_collected_vespene", 0.0)))
-        # Enemy structure damage and destruction
-        enemy_structures_destroyed = float(getattr(score, "killed_value_structures", 0.0))
-        enemy_structure_damage = float(getattr(score, "total_damage_dealt_structures", 0.0))
-        # High-value unit preservation (queens, lair, spire, etc.)
-        preserved_units = float(self.units(UnitTypeId.QUEEN).amount)
-        # Expansion: number of hatcheries built
+        
+        army_count = sum(self.units(u).amount for u in self.army_units)
+        
+        enemy_kills = float(getattr(score, "killed_minerals_units", 0.0)) + float(getattr(score, "killed_vespene_units", 0.0))
+        structure_kills = float(getattr(score, "killed_minerals_structures", 0.0)) + float(getattr(score, "killed_vespene_structures", 0.0))
+        
+        lost_army = float(getattr(score, "lost_minerals_army", 0.0)) + float(getattr(score, "lost_vespene_army", 0.0))
+        lost_workers = float(getattr(score, "lost_minerals_economy", 0.0)) + float(getattr(score, "lost_vespene_economy", 0.0))
+        
         hatcheries = float(self.structures(UnitTypeId.HATCHERY).amount + self.structures(UnitTypeId.LAIR).amount + self.structures(UnitTypeId.HIVE).amount)
+        
+        supply_used = self.supply_used
+        supply_cap = self.supply_cap
+        
         return {
-            "minerals": float(self.minerals),
-            "gas": float(self.vespene),
             "workers": float(self.workers.amount),
-            "army": float(
-                self.units(UnitTypeId.ZERGLING).amount
-                + self.units(UnitTypeId.BANELING).amount
-            ),
-            "killed_units": float(getattr(score, "killed_value_units", 0.0)),
-            "killed_structures": enemy_structures_destroyed,
-            "enemy_structure_damage": enemy_structure_damage,
-            "preserved_units": preserved_units,
+            "army": float(army_count),
+            "enemy_unit_kills": enemy_kills,
+            "enemy_structure_kills": structure_kills,
+            "lost_army": lost_army,
+            "lost_workers": lost_workers,
             "hatcheries": hatcheries,
-            "lost_army": float(getattr(score, "lost_minerals_army", 0.0))
-            + float(getattr(score, "lost_vespene_army", 0.0)),
-            "lost_workers": float(getattr(score, "lost_minerals_economy", 0.0)),
-            "minerals_collected": minerals_collected,
-            "gas_collected": gas_collected,
+            "supply_used": float(supply_used),
+            "supply_cap": float(supply_cap),
             "game_time": float(self.time),
         }
 
@@ -468,51 +577,22 @@ class Scaffold(BotAI):
             return 0.0
 
         w = self._reward_weights
-        delta = {
-            k: current[k] - self._prev_metrics.get(k, 0)
-            for k in ["minerals", "gas", "workers", "army"]
-        }
-        delta_kills = (current["killed_units"] + current["killed_structures"]) - (
-            self._prev_metrics.get("killed_units", 0)
-            + self._prev_metrics.get("killed_structures", 0)
-        )
+
+        delta_workers = current["workers"] - self._prev_metrics.get("workers", 0)
+        delta_army = current["army"] - self._prev_metrics.get("army", 0)
+        delta_enemy_unit_kills = current["enemy_unit_kills"] - self._prev_metrics.get("enemy_unit_kills", 0)
+        delta_enemy_structure_kills = current["enemy_structure_kills"] - self._prev_metrics.get("enemy_structure_kills", 0)
         delta_losses = current["lost_army"] - self._prev_metrics.get("lost_army", 0)
-        delta_worker_loss = current["lost_workers"] - self._prev_metrics.get(
-            "lost_workers", 0
-        )
-
-        # Compute resource acquisition rates (minerals/gas per second)
-        curr_time = current["game_time"]
-        curr_minerals_collected = current["minerals_collected"]
-        curr_gas_collected = current["gas_collected"]
-        mineral_rate = (curr_minerals_collected / curr_time) if curr_time > 0 else 0.0
-        gas_rate = (curr_gas_collected / curr_time) if curr_time > 0 else 0.0
-
-        # Enemy structure damage and destruction
-        delta_enemy_structure_damage = current["enemy_structure_damage"] - self._prev_metrics.get("enemy_structure_damage", 0.0)
-        delta_enemy_structures_destroyed = current["killed_structures"] - self._prev_metrics.get("killed_structures", 0.0)
-        # Unit preservation (change in preserved units)
-        delta_preserved_units = current["preserved_units"] - self._prev_metrics.get("preserved_units", 0.0)
-        # Expansion (change in hatcheries)
-        delta_hatcheries = current["hatcheries"] - self._prev_metrics.get("hatcheries", 0.0)
+        delta_worker_loss = current["lost_workers"] - self._prev_metrics.get("lost_workers", 0)
+        delta_hatcheries = current["hatcheries"] - self._prev_metrics.get("hatcheries", 0)
 
         reward = 0.0
-        reward += w["minerals"] * delta["minerals"]
-        reward += w["gas"] * delta["gas"]
-        reward += w["workers"] * delta["workers"]
-        reward += w["army"] * delta["army"]
-        reward += w["kills"] * delta_kills
+        reward += w["workers"] * delta_workers
+        reward += w["army"] * delta_army
         reward += w["losses"] * delta_losses
         reward += w["worker_loss"] * delta_worker_loss
-        # Add reward for resource acquisition rate
-        reward += w["mineral_rate"] * mineral_rate
-        reward += w["gas_rate"] * gas_rate
-        # Add reward for enemy structure damage and destruction
-        reward += w["enemy_structure_damage"] * delta_enemy_structure_damage
-        reward += w["enemy_structure_destroyed"] * delta_enemy_structures_destroyed
-        # Add reward for unit preservation (high-value units)
-        reward += w["unit_preservation"] * delta_preserved_units
-        # Add reward for expansion (new hatcheries)
+        reward += w["enemy_unit_kills"] * delta_enemy_unit_kills
+        reward += w["enemy_structure_destroyed"] * delta_enemy_structure_kills
         reward += w["expansion"] * delta_hatcheries
 
         if action_succeeded:
@@ -520,10 +600,8 @@ class Scaffold(BotAI):
         if self.supply_left <= 0:
             reward += w["supply_penalty"]
 
-        reward -= 0.0001  # survival bonus
-
         self._prev_metrics = current
-        return float(max(-0.5, min(1.0, reward)))
+        return float(max(-0.1, min(0.1, reward)))
 
     def _log_step(self, iteration: int, action: int, succeeded: bool, reward: float):
         if self._log_level < 1:
@@ -595,7 +673,48 @@ class Scaffold(BotAI):
         hatch = self.structures(UnitTypeId.HATCHERY).ready.first
         pos = hatch.position.towards(self.game_info.map_center, 5)
         return await self.build(UnitTypeId.SPAWNINGPOOL, near=pos)
-    
+
+    async def build_evolution_chamber(self) -> bool:
+        if self.structures(UnitTypeId.EVOLUTIONCHAMBER):
+            return False
+        if not self.structures(UnitTypeId.HATCHERY).ready:
+            return False
+        if not self.can_afford(UnitTypeId.EVOLUTIONCHAMBER):
+            return False
+        hatch = self.structures(UnitTypeId.HATCHERY).ready.first
+        pos = hatch.position.towards(self.game_info.map_center, 5)
+        return await self.build(UnitTypeId.EVOLUTIONCHAMBER, near=pos)
+
+    async def build_ultralisk_cavern(self) -> bool:
+        if self.structures(UnitTypeId.ULTRALISKCAVERN):
+            return False
+        if not self.structures(UnitTypeId.LAIR).ready:
+            return False
+        if not self.can_afford(UnitTypeId.ULTRALISKCAVERN):
+            return False
+        lair = self.structures(UnitTypeId.LAIR).ready.first
+        pos = lair.position.towards(self.game_info.map_center, 5)
+        return await self.build(UnitTypeId.ULTRALISKCAVERN, near=pos)
+
+    async def build_nydus_canal(self) -> bool:
+        if self.can_afford(UnitTypeId.NYDUSCANAL):
+            if self.structures(UnitTypeId.HATCHERY).ready:
+                hatch = self.structures(UnitTypeId.HATCHERY).ready.first
+                pos = hatch.position.towards(self.game_info.map_center, 5)
+                return await self.build(UnitTypeId.NYDUSCANAL, near=pos)
+        return False
+
+    async def build_lurker_den(self) -> bool:
+        if self.structures(UnitTypeId.LURKERDENMP):
+            return False
+        if not self.structures(UnitTypeId.LAIR).ready:
+            return False
+        if not self.can_afford(UnitTypeId.LURKERDENMP):
+            return False
+        lair = self.structures(UnitTypeId.LAIR).ready.first
+        pos = lair.position.towards(self.game_info.map_center, 5)
+        return await self.build(UnitTypeId.LURKERDENMP, near=pos)
+
     async def build_roach_warren(self) -> bool:
         if self.structures(UnitTypeId.ROACHWARREN):
             return False
@@ -685,6 +804,9 @@ class Scaffold(BotAI):
         return issued
 
     async def build_spine_crawler(self) -> bool:
+        # Avoid repeatedly building spines: skip if one exists or is pending
+        if self.structures(UnitTypeId.SPINECRAWLER).exists or self.already_pending(UnitTypeId.SPINECRAWLER):
+            return False
         if not self.can_afford(UnitTypeId.SPINECRAWLER):
             return False
         if not self.structures(UnitTypeId.HATCHERY).ready:
@@ -694,6 +816,9 @@ class Scaffold(BotAI):
         return await self.build(UnitTypeId.SPINECRAWLER, near=pos)
 
     async def build_spore_crawler(self) -> bool:
+        # Avoid repeatedly building spores: skip if one exists or is pending
+        if self.structures(UnitTypeId.SPORECRAWLER).exists or self.already_pending(UnitTypeId.SPORECRAWLER):
+            return False
         if not self.can_afford(UnitTypeId.SPORECRAWLER):
             return False
         if not self.structures(UnitTypeId.HATCHERY).ready:
@@ -763,13 +888,41 @@ class Scaffold(BotAI):
             return True
         return False
 
+    async def research_ground_armor(self) -> bool:
+        if not self.structures(UnitTypeId.EVOLUTIONCHAMBER).ready:
+            return False
+        if not self.can_afford(UnitTypeId.EVOLUTIONCHAMBER):
+            return False
+        evo = self.structures(UnitTypeId.EVOLUTIONCHAMBER).ready.first
+        self.do(evo.research(UpgradeId.ZERGGROUNDARMORSLEVEL1))
+        return True
+
+    async def research_air_armor(self) -> bool:
+        if not self.structures(UnitTypeId.EVOLUTIONCHAMBER).ready:
+            return False
+        if not self.can_afford(UnitTypeId.EVOLUTIONCHAMBER):
+            return False
+        evo = self.structures(UnitTypeId.EVOLUTIONCHAMBER).ready.first
+        self.do(evo.research(UpgradeId.ZERGFLYERARMORSLEVEL1))
+        return True
+
+    async def research_neural_parasite(self) -> bool:
+        if self.structures(UnitTypeId.INFESTATIONPIT).ready:
+            pit = self.structures(UnitTypeId.INFESTATIONPIT).ready.first
+            self.do(pit.research(UpgradeId.NEURALPARASITE))
+            return True
+        return False
+
     async def retreat(self) -> bool:
-        # Only command idle combat units (self.army_units)
+        if self.units.idle.of_type(self.army_units).amount == 0:
+            return False
         for unit in self.units.idle.of_type(self.army_units):
             self.do(unit.move(self.start_location))
         return True
 
     async def regroup(self) -> bool:
+        if self.start_location is None:
+            return False
         rally = self.start_location.towards(self.game_info.map_center, 8)
         for unit in self.units.idle.of_type(self.army_units):
             self.do(unit.move(rally))
@@ -818,7 +971,7 @@ class Scaffold(BotAI):
             return False
         if not self.can_afford(UnitTypeId.LAIR):
             return False
-        hatch = hatcheries.first
+        hatch = hatcheries.closest_to(self.start_location)
         self.do(hatch.build(UnitTypeId.LAIR))
         return True
 

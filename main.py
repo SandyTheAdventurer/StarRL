@@ -8,14 +8,13 @@ from staragent import StarAgent
 
 MAP = "CeruleanFallLE"
 EPISODES = 1
-difficulty = Difficulty.VeryEasy
+difficulty = Difficulty.Medium
 RENDER = True
-TIMEOUT = 15 * 60 * 22.4  # 15 minutes
-LOG = False
+TIMEOUT = 30 * 60  # 30 minutes
 
 ai = StarAgent(train_mode=False, log_mlflow=False)
-ai.load_checkpoint("checkpoints/hannibal_v6.pt")
-
+ai.load_checkpoint("checkpoints/hannibal_v29.pt")
+ai._log_level = 1
 star_bot = Bot(
     Race.Zerg, ai
 )
