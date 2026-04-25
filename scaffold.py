@@ -3,6 +3,7 @@ from sc2.ids.unit_typeid import UnitTypeId
 from sc2.ids.ability_id import AbilityId
 from sc2.ids.upgrade_id import UpgradeId
 from sc2.position import Point2
+from sc2.unit import Unit
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -15,7 +16,7 @@ class Scaffold(BotAI):
         log_level: int = 0,
     ):
         super().__init__()
-        self.observation_space = ((12, 64, 64), 8)
+        self.observation_space = ((12, 64, 64), 9)
         # 0: no-op
         # 1: build spawning pool
         # 2: train zerglings
@@ -69,26 +70,52 @@ class Scaffold(BotAI):
         # 50: research ground armor
         # 51: research air armor
         # 52: research neural parasite
-        # 53: build infestation pit
-        # 54: build baneling nest
-        # 55: build greater spire
-        # 56: train brood lord
+        # 53: build overseer
+        # 54: spawn changeling
+        # 55: load nydus
+        # 56: unload nydus
         self.total_actions = 57
 
         self._reward_weights = reward_weights or {
-            "workers": 0.002,
-            "army": 0.002,
-            "losses": -0.002,
-            "worker_loss": -0.001,
+            "workers": 0.01,
+            "army": 0.005,
+            "losses": -0.005,
+            "worker_loss": -0.002,
             "success": 0.001,
-            "supply_penalty": -0.001,
-            "enemy_unit_kills": 0.005,
-            "enemy_structure_destroyed": 0.01,
-            "expansion": 0.005,
+            "supply_penalty": -0.005,
+            "enemy_unit_kills": 0.02,
+            "enemy_structures_destroyed": 0.1,
+            "expansion": 0.02,
+            "resource_surplus": 0.001,
+            "structure_built": 0.001,
+            "low_worker_penalty": -0.01,
+            "income_rate": 0.02,
+            "worker_saturation": 0.005,
+            "workers_per_hatchery": 0.02,
+            "worker_milestone_16": 0.2,
+            "worker_milestone_32": 0.3,
+            "worker_milestone_48": 0.4,
+            "worker_milestone_60": 0.5,
+            "attack_action": 0.05,
+            "enemy_base_proximity": 0.02,
+            "army_movement": 0.005,
         }
         self._log_level = log_level
         self.army_units = [UnitTypeId.ZERGLING, UnitTypeId.BANELING, UnitTypeId.HYDRALISK, UnitTypeId.MUTALISK, UnitTypeId.ROACH, UnitTypeId.CORRUPTOR, UnitTypeId.BROODLORD, UnitTypeId.ULTRALISK, UnitTypeId.INFESTOR, UnitTypeId.LURKERMP]
+        self.worker_types = [UnitTypeId.DRONE, UnitTypeId.PROBE, UnitTypeId.SCV]
+        self.structure_types = [UnitTypeId.SPAWNINGPOOL, UnitTypeId.HYDRALISKDEN, UnitTypeId.SPIRE, UnitTypeId.ROACHWARREN, UnitTypeId.BANELINGNEST, UnitTypeId.INFESTATIONPIT, UnitTypeId.GREATERSPIRE, UnitTypeId.SPINECRAWLER, UnitTypeId.SPORECRAWLER, UnitTypeId.EVOLUTIONCHAMBER, UnitTypeId.ULTRALISKCAVERN, UnitTypeId.NYDUSCANAL, UnitTypeId.LURKERDEN, UnitTypeId.HATCHERY, UnitTypeId.LAIR, UnitTypeId.HIVE]
+        self._cumulative_stats = {
+            "workers_created": 0,
+            "army_units_created": 0,
+            "structures_built": 0,
+            "units_lost": 0,
+            "structures_lost": 0,
+            "enemy_units_killed": 0,
+            "enemy_structures_destroyed": 0,
+        }
         self._prev_metrics = None
+        self._prev_minerals = None
+        self._prev_time = None
 
     def get_observation(self):
         target_h = self.observation_space[0][1]
@@ -139,6 +166,10 @@ class Scaffold(BotAI):
             / 100.0
         )
         drone_supply = (self.units(UnitTypeId.DRONE).amount * 1) / 200.0
+        income_rate = 0.0
+        if self._prev_minerals is not None and self._prev_time is not None and self.time > self._prev_time:
+            dt = self.time - self._prev_time
+            income_rate = min((self.minerals - self._prev_minerals) / max(dt, 0.1), 1000) / 1000.0
         resources = np.array(
             [
                 gas_available,
@@ -149,6 +180,7 @@ class Scaffold(BotAI):
                 worker_count,
                 army_count,
                 drone_supply,
+                income_rate,
             ],
             dtype=np.float32,
         )
@@ -354,16 +386,18 @@ class Scaffold(BotAI):
         if action_idx == 52:
             return await self.research_neural_parasite()
         if action_idx == 53:
-            return await self.build_infestation_pit()
+            return await self.build_overseer()
         if action_idx == 54:
-            return await self.build_baneling_nest()
+            return await self.spawn_changeling()
         if action_idx == 55:
-            return await self.build_greater_spire()
+            return await self.load_nydus()
         if action_idx == 56:
-            return await self.train_brood_lord(1)
+            return await self.unload_nydus()
         return False
 
     async def build_hydralisk_den(self):
+        if self.structures(UnitTypeId.HYDRALISKDEN).exists:
+            return False
         if self.can_afford(UnitTypeId.HYDRALISKDEN) and self.structures(UnitTypeId.LAIR).ready:
             lair = self.structures(UnitTypeId.LAIR).ready.first
             pos = lair.position.towards(self.game_info.map_center, 5)
@@ -372,6 +406,8 @@ class Scaffold(BotAI):
         return False
 
     async def build_spire(self):
+        if self.structures(UnitTypeId.SPIRE).exists:
+            return False
         if self.can_afford(UnitTypeId.SPIRE) and self.structures(UnitTypeId.LAIR).ready:
             lair = self.structures(UnitTypeId.LAIR).ready.first
             pos = lair.position.towards(self.game_info.map_center, 5)
@@ -395,12 +431,13 @@ class Scaffold(BotAI):
         return False
 
     async def train_flying_unit(self, n=1):
-        # Example: Mutalisk (flying unit)
         if self.can_afford(UnitTypeId.MUTALISK) and self.structures(UnitTypeId.SPIRE).ready:
             for _ in range(n):
-                larva = self.units(UnitTypeId.LARVA).filter(lambda l: l.tag not in self.unit_tags_received_action).first
-                if larva:
-                    self.do(larva.train(UnitTypeId.MUTALISK))
+                available_larva = self.units(UnitTypeId.LARVA).filter(lambda l: l.tag not in self.unit_tags_received_action)
+                if not available_larva:
+                    return False
+                larva = available_larva.first
+                self.do(larva.train(UnitTypeId.MUTALISK))
             return True
         return False
     
@@ -541,6 +578,51 @@ class Scaffold(BotAI):
             issued = True
         return issued
 
+    async def build_overseer(self) -> bool:
+        if not self.can_afford(UnitTypeId.OVERSEER):
+            return False
+        if not self.structures(UnitTypeId.LAIR).ready and not self.structures(UnitTypeId.HIVE).ready:
+            return False
+        hatch = (self.structures(UnitTypeId.LAIR).ready or self.structures(UnitTypeId.HIVE).ready).first
+        self.do(hatch.train(UnitTypeId.OVERSEER))
+        return True
+
+    async def spawn_changeling(self) -> bool:
+        overseers = self.units(UnitTypeId.OVERSEER).ready
+        if not overseers:
+            return False
+        overseer = overseers.first
+        if overseer.energy >= 50:
+            self.do(overseer(AbilityId.SPAWNCHANGELING_CHANGELING))
+            return True
+        return False
+
+    async def load_nydus(self) -> bool:
+        nyduses = self.structures(UnitTypeId.NYDUSCANAL).ready
+        if not nyduses:
+            return False
+        army = self.units.of_type(self.army_units).ready.idle
+        if not army:
+            return False
+        loaded = 0
+        for nydus in nyduses:
+            for unit in army:
+                if unit.distance_to(nydus) <= 15:
+                    self.do(unit.load(nydus))
+                    loaded += 1
+        return loaded > 0
+
+    async def unload_nydus(self) -> bool:
+        nyduses = self.structures(UnitTypeId.NYDUSCANAL).ready
+        if not nyduses:
+            return False
+        unloaded = 0
+        for nydus in nyduses:
+            if nydus.cargo_used > 0:
+                self.do(nydus.unload_all())
+                unloaded += 1
+        return unloaded > 0
+
     def _collect_metrics(self) -> dict:
         score = self.state.score
         
@@ -561,19 +643,22 @@ class Scaffold(BotAI):
             "workers": float(self.workers.amount),
             "army": float(army_count),
             "enemy_unit_kills": enemy_kills,
-            "enemy_structure_kills": structure_kills,
+            "enemy_structures_destroyed": structure_kills,
             "lost_army": lost_army,
             "lost_workers": lost_workers,
             "hatcheries": hatcheries,
             "supply_used": float(supply_used),
             "supply_cap": float(supply_cap),
             "game_time": float(self.time),
+            "structures": float(self.structures.amount),
         }
 
-    def _compute_step_reward(self, action_succeeded: bool) -> float:
+    def _compute_step_reward(self, action_succeeded: bool, action_idx: int = -1) -> float:
         current = self._collect_metrics()
         if self._prev_metrics is None:
             self._prev_metrics = current
+            self._prev_minerals = self.minerals
+            self._prev_time = self.time
             return 0.0
 
         w = self._reward_weights
@@ -581,27 +666,100 @@ class Scaffold(BotAI):
         delta_workers = current["workers"] - self._prev_metrics.get("workers", 0)
         delta_army = current["army"] - self._prev_metrics.get("army", 0)
         delta_enemy_unit_kills = current["enemy_unit_kills"] - self._prev_metrics.get("enemy_unit_kills", 0)
-        delta_enemy_structure_kills = current["enemy_structure_kills"] - self._prev_metrics.get("enemy_structure_kills", 0)
+        delta_enemy_structures_destroyed = current.get("enemy_structures_destroyed", 0) - self._prev_metrics.get("enemy_structures_destroyed", 0)
         delta_losses = current["lost_army"] - self._prev_metrics.get("lost_army", 0)
         delta_worker_loss = current["lost_workers"] - self._prev_metrics.get("lost_workers", 0)
         delta_hatcheries = current["hatcheries"] - self._prev_metrics.get("hatcheries", 0)
+        delta_structures = current["structures"] - self._prev_metrics.get("structures", 0)
+
+        # NOTE: cumulative stats are maintained by event handlers
+        # (on_unit_created, on_building_construction_complete, on_unit_destroyed).
+        # Avoid updating those counters here to prevent double-counting.
 
         reward = 0.0
-        reward += w["workers"] * delta_workers
-        reward += w["army"] * delta_army
-        reward += w["losses"] * delta_losses
-        reward += w["worker_loss"] * delta_worker_loss
-        reward += w["enemy_unit_kills"] * delta_enemy_unit_kills
-        reward += w["enemy_structure_destroyed"] * delta_enemy_structure_kills
-        reward += w["expansion"] * delta_hatcheries
+        reward += w.get("workers", 0) * delta_workers
+        reward += w.get("army", 0) * delta_army
+        reward += w.get("losses", 0) * delta_losses
+        reward += w.get("worker_loss", 0) * delta_worker_loss
+        reward += w.get("enemy_unit_kills", 0) * delta_enemy_unit_kills
+        reward += w.get("enemy_structures_destroyed", 0) * delta_enemy_structures_destroyed
+        reward += w.get("expansion", 0) * delta_hatcheries
 
         if action_succeeded:
-            reward += w["success"]
+            reward += w.get("success", 0)
+
+        # Normalize income rate consistently with observation preprocessing
+        income_rate_norm = 0.0
+        if self._prev_minerals is not None and self._prev_time is not None and self.time > self._prev_time:
+            dt = self.time - self._prev_time
+            income_rate_norm = min((self.minerals - self._prev_minerals) / max(dt, 0.1), 1000) / 1000.0
+        reward += w.get("income_rate", 0) * income_rate_norm
+
+        # Use normalized mineral reserve (matches get_observation scaling) to avoid raw hoarding incentive
+        resource_surplus_norm = min(self.minerals / 1500.0, 1.0)
+        reward += w.get("resource_surplus", 0) * resource_surplus_norm
+
+        # Penalize deviation from ideal worker saturation (both under- and over-staffing)
+        ideal_workers = current.get("hatcheries", 0) * 16
+        saturation_gap = abs(current.get("workers", 0) - ideal_workers)
+        if ideal_workers > 0:
+            saturation_penalty = saturation_gap / float(max(1.0, ideal_workers))
+        else:
+            saturation_penalty = saturation_gap
+        reward -= w.get("worker_saturation", 0) * saturation_penalty
+
+        target_workers_per_base = 16
+        if current["hatcheries"] > 0:
+            workers_per_base = current["workers"] / current["hatcheries"]
+            if workers_per_base >= target_workers_per_base:
+                reward += w["workers_per_hatchery"]
+
+        if action_succeeded and action_idx == 3:
+            reward += w["attack_action"]
+
+        if delta_structures > 0:
+            reward += w["structure_built"]
+
+        if current["workers"] < 5 and current["hatcheries"] >= 1:
+            reward += w["low_worker_penalty"]
+
         if self.supply_left <= 0:
             reward += w["supply_penalty"]
 
+        enemy_base = self.enemy_start_locations[0] if self.enemy_start_locations else None
+        if enemy_base:
+            army = self.units.of_type(self.army_units)
+            if army:
+                army_center = army.center
+                dist_to_enemy = army_center.distance_to(enemy_base)
+                if dist_to_enemy < 20:
+                    reward += w["enemy_base_proximity"] * (1.0 - dist_to_enemy / 20)
+
+        current_army = self.units.of_type(self.army_units).ready
+        if current_army:
+            idle_army = current_army.idle
+            if idle_army and action_idx in (27, 28):
+                reward += w["army_movement"]
+
+        wn = current["workers"]
+        if wn >= 16 and not getattr(self, '_milestone_16_achieved', False):
+            self._milestone_16_achieved = True
+            reward += w.get("worker_milestone_16", 0)
+        if wn >= 32 and not getattr(self, '_milestone_32_achieved', False):
+            self._milestone_32_achieved = True
+            reward += w.get("worker_milestone_32", 0)
+        if wn >= 48 and not getattr(self, '_milestone_48_achieved', False):
+            self._milestone_48_achieved = True
+            reward += w.get("worker_milestone_48", 0)
+        if wn >= 60 and not getattr(self, '_milestone_60_achieved', False):
+            self._milestone_60_achieved = True
+            reward += w.get("worker_milestone_60", 0)
+
         self._prev_metrics = current
-        return float(max(-0.1, min(0.1, reward)))
+        self._prev_minerals = self.minerals
+        self._prev_time = self.time
+        # Relax final clipping to preserve useful gradient information
+        return float(max(-1.0, min(1.0, reward)))
 
     def _log_step(self, iteration: int, action: int, succeeded: bool, reward: float):
         if self._log_level < 1:
@@ -705,7 +863,7 @@ class Scaffold(BotAI):
         return False
 
     async def build_lurker_den(self) -> bool:
-        if self.structures(UnitTypeId.LURKERDENMP):
+        if self.structures(UnitTypeId.LURKERDENMP).exists:
             return False
         if not self.structures(UnitTypeId.LAIR).ready:
             return False
@@ -716,7 +874,7 @@ class Scaffold(BotAI):
         return await self.build(UnitTypeId.LURKERDENMP, near=pos)
 
     async def build_roach_warren(self) -> bool:
-        if self.structures(UnitTypeId.ROACHWARREN):
+        if self.structures(UnitTypeId.ROACHWARREN).exists:
             return False
         if not self.structures(UnitTypeId.LAIR).ready:
             return False
@@ -916,6 +1074,8 @@ class Scaffold(BotAI):
     async def retreat(self) -> bool:
         if self.units.idle.of_type(self.army_units).amount == 0:
             return False
+        if self.start_location is None:
+            return False
         for unit in self.units.idle.of_type(self.army_units):
             self.do(unit.move(self.start_location))
         return True
@@ -930,6 +1090,8 @@ class Scaffold(BotAI):
 
     async def focus_fire(self) -> bool:
         if self.enemy_units and self.enemy_units.amount > 0:
+            if self.start_location is None:
+                return False
             target = self.enemy_units.closest_to(self.start_location)
             for unit in self.units.idle.of_type(self.army_units):
                 self.do(unit.attack(target))
@@ -970,6 +1132,8 @@ class Scaffold(BotAI):
         if self.structures(UnitTypeId.LAIR):
             return False
         if not self.can_afford(UnitTypeId.LAIR):
+            return False
+        if self.start_location is None:
             return False
         hatch = hatcheries.closest_to(self.start_location)
         self.do(hatch.build(UnitTypeId.LAIR))
@@ -1069,6 +1233,16 @@ class Scaffold(BotAI):
         if max_idle_orders <= 0:
             return
 
+        ideal_workers = self.structures(UnitTypeId.HATCHERY).amount * 16
+        if self.units(UnitTypeId.LAIR).ready:
+            ideal_workers += 16
+        if self.units(UnitTypeId.HIVE).ready:
+            ideal_workers += 16
+
+        if self.workers.amount < ideal_workers and self.larva and self.can_afford(UnitTypeId.DRONE) and self.supply_left > 0:
+            larva = self.larva.random
+            self.do(larva.train(UnitTypeId.DRONE))
+
         gatherable_workers = self.workers.filter(lambda w: not w.is_constructing_scv)
 
         if gatherable_workers.idle and self.mineral_field:
@@ -1128,3 +1302,115 @@ class Scaffold(BotAI):
                 self.do(larva.train(UnitTypeId.ROACH))
                 issued = True
         return issued
+    
+    def get_performance_metrics(self) -> dict:  
+        score = self.state.score  
+        
+        economic_metrics = {
+            "mineral_collection_efficiency": score.collected_minerals / max(score.spent_minerals, 1),
+            "vespene_collection_efficiency": score.collected_vespene / max(score.spent_vespene, 1),  
+            "idle_worker_time": score.idle_worker_time,  
+            "idle_production_time": score.idle_production_time,  
+        }  
+        
+        military_metrics = {  
+            "total_damage_dealt": score.total_damage_dealt_life + score.total_damage_dealt_shields,  
+            "total_damage_taken": score.total_damage_taken_life + score.total_damage_taken_shields,  
+            "damage_ratio": (score.total_damage_dealt_life + score.total_damage_dealt_shields) /   
+                        max(score.total_damage_taken_life + score.total_damage_taken_shields, 1),  
+            "kill_value_ratio": score.killed_value_units / max(  
+                score.lost_minerals_army + score.lost_vespene_army +   
+                score.lost_minerals_economy + score.lost_vespene_economy, 1),
+        }  
+        
+        resource_metrics = {  
+            "total_resources_collected": score.collected_minerals + score.collected_vespene,
+            "total_resources_spent": score.spent_minerals + score.spent_vespene,  
+            "resource_spending_rate": (score.spent_minerals + score.spent_vespene) /   
+                                    max(score.collected_minerals + score.collected_vespene, 1),
+        }  
+        
+        production_metrics = {  
+            "total_unit_value": score.total_value_units,  
+            "total_structure_value": score.total_value_structures,  
+            "total_value_created": score.total_value_units + score.total_value_structures,  
+            "value_lost_units": (score.lost_minerals_army + score.lost_vespene_army +   
+                            score.lost_minerals_economy + score.lost_vespene_economy),  
+            "value_lost_structures": score.lost_minerals_technology + score.lost_vespene_technology,  
+            "net_value_retained": (score.total_value_units + score.total_value_structures) -   
+                                ((score.lost_minerals_army + score.lost_vespene_army +   
+                                score.lost_minerals_economy + score.lost_vespene_economy) +  
+                                (score.lost_minerals_technology + score.lost_vespene_technology)),  
+        }  
+        
+        army_composition = {  
+            "workers": self.workers.amount,  
+            "army_count": self.units.amount - self.workers.amount,  
+            "structure_count": self.structures.amount,  
+            "supply_army": self.supply_army,  
+            "supply_workers": self.supply_workers,  
+            "supply_economy": score.food_used_economy,  
+            "supply_technology": score.food_used_technology,  
+        }  
+        
+        return {  
+            "economic": economic_metrics,  
+            "military": military_metrics,   
+            "resources": resource_metrics,  
+            "production": production_metrics,  
+            "composition": army_composition,  
+            "game_time": self.time,  
+            "cumulative": self._cumulative_stats.copy(),
+        }
+
+    async def on_unit_created(self, unit: Unit):
+        await super().on_unit_created(unit)
+        unit_type = unit.type_id
+        
+        if unit_type in self.worker_types:
+            self._cumulative_stats["workers_created"] += 1
+        elif unit_type in self.army_units:
+            self._cumulative_stats["army_units_created"] += 1
+        # Structure build completions are tracked in on_building_construction_complete
+
+    async def on_building_construction_complete(self, unit: Unit):
+        await super().on_building_construction_complete(unit)
+        if unit.type_id in self.structure_types:
+            self._cumulative_stats["structures_built"] += 1
+
+    async def on_unit_destroyed(self, unit_tag: int):  
+        await super().on_unit_destroyed(unit_tag)  
+        
+        unit = self._all_units_previous_map.get(unit_tag)  
+        if not unit:  
+            return
+        
+        if unit.is_enemy:  
+            if unit.type_id in self.army_units or unit.type_id in self.worker_types:  
+                self._cumulative_stats["enemy_units_killed"] += 1  
+            elif unit.type_id in self.structure_types:  
+                self._cumulative_stats["enemy_structures_destroyed"] += 1  
+        elif unit.is_mine:  
+            if unit.type_id in self.army_units or unit.type_id in self.worker_types:  
+                self._cumulative_stats["units_lost"] += 1  
+            elif unit.type_id in self.structure_types:  
+                self._cumulative_stats["structures_lost"] += 1
+
+    def reset_cumulative_stats(self):
+        self._cumulative_stats = {
+            "workers_created": 0,
+            "army_units_created": 0,
+            "structures_built": 0,
+            "enemy_units_killed": 0,
+            "enemy_structures_destroyed": 0,
+            "units_lost": 0,
+            "structures_lost": 0,
+        }
+        # Reset bookkeeping and milestones used for reward shaping
+        self._prev_metrics = None
+        self._prev_minerals = None
+        self._prev_time = None
+        self._milestone_16_achieved = False
+        self._milestone_32_achieved = False
+        self._milestone_48_achieved = False
+        self._milestone_60_achieved = False

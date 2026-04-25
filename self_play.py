@@ -1,14 +1,33 @@
-import sc2
-from sc2.main import run_game
-from sc2.data import Difficulty, Race, Result
-from sc2.player import Bot, Computer
-from staragent import StarAgent
-import mlflow
-import numpy as np
-import asyncio
+import json
 import logging
+import random
 import signal
 import os
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import mlflow
+from utils import update_elo, evaluate_agent, plot_radar_chart
+import sc2
+from sc2.data import Difficulty, Race, Result
+from sc2.main import run_game
+from sc2.player import Bot, Computer
+
+from bots.protoss.cannon_rush import CannonRushBot
+from bots.protoss.find_adept_shades import FindAdeptShadesBot
+from bots.protoss.threebase_voidray import ThreebaseVoidrayBot
+from bots.protoss.warpgate_push import WarpGateBot
+from bots.terran.cyclone_push import CyclonePush
+from bots.terran.mass_reaper import MassReaperBot
+from bots.terran.onebase_battlecruiser import BCRushBot
+from bots.terran.proxy_rax import ProxyRaxBot
+from bots.zerg.banes_banes_banes import BanesBanesBanes
+from bots.zerg.expand_everywhere import ExpandEverywhere
+from bots.zerg.hydralisk_push import Hydralisk
+from bots.zerg.onebase_broodlord import BroodlordBot
+from bots.zerg.zerg_rush import ZergRushBot
+from staragent import StarAgent
+
 
 class PortpickerFilter(logging.Filter):
     def filter(self, record):
@@ -32,10 +51,13 @@ class ColoredFormatter(logging.Formatter):
     RESET = "\033[0m"
 
     def format(self, record):
-        levelname = record.levelname
-        color = self.COLORS.get(levelname, self.RESET)
-        record.levelname = f"{color}{levelname}{self.RESET}"
-        return super().format(record)
+        original_levelname = record.levelname
+        color = self.COLORS.get(original_levelname, self.RESET)
+        record.levelname = f"{color}{original_levelname}{self.RESET}"
+        try:
+            return super().format(record)
+        finally:
+            record.levelname = original_levelname
 
 
 logging.basicConfig(
@@ -51,24 +73,16 @@ else:
     handler.setFormatter(ColoredFormatter())
     logger.addHandler(handler)
 
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
 
 TIMEOUT = 30 * 60
-EVAL_EPISODES = 10
-SAVE_EPISODES = 3
-PROMOTION_TRIES = 3
+SAVE_EPISODES = 4
 ROUNDS = 200
-CHKPT_DIR = "checkpoints"
-MAPS = []
+CHKPT_DIR = Path("checkpoints")
+MAPS_DIR = Path("StarCraftII/maps")
+ELO_RATINGS_PATH = Path("elo_ratings.json")
+EXPERIMENT_NAME = "starcraft-selfplay"
 
-for root, dirs, files in os.walk("StarCraftII/maps"):
-        for file in files:
-            if file.endswith(".SC2Map"):
-                map_name = os.path.splitext(file)[0]
-                MAPS.append(map_name)
-
-print(f"Found {len(MAPS)}")
+os.makedirs("charts", exist_ok=True)
 
 MEAT_WALLS = [
     Computer(Race.Random, Difficulty.VeryEasy),
@@ -80,7 +94,7 @@ MEAT_WALLS = [
     Computer(Race.Random, Difficulty.VeryHard),
     Computer(Race.Random, Difficulty.CheatVision),
     Computer(Race.Random, Difficulty.CheatMoney),
-    Computer(Race.Random, Difficulty.CheatInsane)
+    Computer(Race.Random, Difficulty.CheatInsane),
 ]
 
 MEAT_WALLS_NAME = [
@@ -93,124 +107,261 @@ MEAT_WALLS_NAME = [
     "VeryHard",
     "CheatVision",
     "CheatMoney",
-    "CheatInsane"
+    "CheatInsane",
 ]
 
-meat_level = 0
-v = 0
-versions = []
-wins = 0
-ties = 0
-losses = 0
-games_played = 0
-total_game_duration = 0
+ELO_INITIAL = 1200
 
-hannibal_agent = StarAgent(train_mode=True, name="Hannibal", log_mlflow=True)
-hannibal = Bot(Race.Zerg, hannibal_agent, name="Hannibal")
-hannibal_agent.save_checkpoint(f"{CHKPT_DIR}/hannibal_v{v}.pt")
-versions.append(f"hannibal_v{v}.pt")
-
-scipio_agent = StarAgent(train_mode=False, name="Scipio", log_mlflow=False)
-scipio = Bot(Race.Zerg, scipio_agent, name="Scipio")
-
-mlflow.set_experiment("starcraft-selfplay")
-mlflow.end_run()
-mlflow.start_run()
+SCRIPTED_BOTS = [
+    (Race.Zerg, BanesBanesBanes),
+    (Race.Zerg, ExpandEverywhere),
+    (Race.Zerg, Hydralisk),
+    (Race.Zerg, BroodlordBot),
+    (Race.Zerg, ZergRushBot),
+    (Race.Protoss, CannonRushBot),
+    (Race.Protoss, FindAdeptShadesBot),
+    (Race.Protoss, ThreebaseVoidrayBot),
+    (Race.Protoss, WarpGateBot),
+    (Race.Terran, CyclonePush),
+    (Race.Terran, MassReaperBot),
+    (Race.Terran, BCRushBot),
+    (Race.Terran, ProxyRaxBot),
+]
 
 should_stop = False
 
-
 def signal_handler(signum, frame):
+    del signum, frame
     global should_stop
     logger.warning("Received Ctrl+C, finishing current round then stopping...")
     should_stop = True
 
+def log_elo_artifact(elo_ratings):
+    with ELO_RATINGS_PATH.open("w") as f:
+        json.dump(elo_ratings, f, indent=2, sort_keys=True)
+    mlflow.log_artifact(str(ELO_RATINGS_PATH))
 
-def log_game_result(result, game_duration, final_minerals, final_gas):
-    global wins, ties, losses, games_played, total_game_duration
-    
-    is_victory = result == Result.Victory
-    is_tie = result == Result.Tie
-    
-    if is_victory:
-        wins += 1
-    elif is_tie:
-        ties += 1
-    else:
-        losses += 1
-    games_played += 1
-    total_game_duration += game_duration
-    
-    mlflow.log_metric("win", int(is_victory))
-    mlflow.log_metric("tie", int(is_tie))
-    mlflow.log_metric("loss", int(not is_victory and not is_tie))
-    mlflow.log_metric("win_rate", wins / games_played)
-    mlflow.log_metric("tie_rate", ties / games_played)
-    mlflow.log_metric("loss_rate", losses / games_played)
-    mlflow.log_metric("game_duration_seconds", game_duration)
-    mlflow.log_metric("final_minerals", final_minerals)
-    mlflow.log_metric("final_gas", final_gas)
+def main():
+    global should_stop
 
+    should_stop = False
+    CHKPT_DIR.mkdir(parents=True, exist_ok=True)
+    maps = sorted(
+        path.stem for path in MAPS_DIR.rglob("*.SC2Map")
+        if "mini_games" not in path.parts
+    )
+    logger.info(f"Found {len(maps)} maps")
+    if not maps:
+        raise AssertionError(f"No SC2Map files found in {MAPS_DIR}")
+    signal.signal(signal.SIGINT, signal_handler)
 
-signal.signal(signal.SIGINT, signal_handler)
+    meat_level = 0
+    v = 1
+    versions = []
+    elo_ratings = {}
+    stats = {
+        "wins": 0,
+        "ties": 0,
+        "losses": 0,
+    }
 
-for round in range(1, ROUNDS + 1):
-    if should_stop:
-        logger.info("Stopping after current round completes.")
-        break
+    map_rng = random.Random()
+    round_num = 0
 
-    if round % EVAL_EPISODES != 0:
-        scipio_v = np.random.choice(versions)
-        scipio_agent.load_checkpoint(f"{CHKPT_DIR}/{scipio_v}")
-        logger.info(f"Round {round}/{ROUNDS} hannibal vs {scipio_v}")
-        results = run_game(sc2.maps.get(np.random.choice(MAPS)), [hannibal, scipio], realtime=False, game_time_limit=TIMEOUT)
-        logger.debug(f"Results: {results}")
-        result = results[0] if isinstance(results, list) else results
-        game_duration = hannibal_agent.time
-        final_minerals = hannibal_agent.minerals
-        final_gas = hannibal_agent.vespene
-        if hasattr(result, 'name'):
-            logger.info(f"Round {round} result: {result.name} (duration: {game_duration:.0f}s, minerals: {final_minerals:.0f}, gas: {final_gas:.0f})")
-        else:
-            logger.warning(f"Round {round} result: Connection error - {result}")
-        log_game_result(result, game_duration, final_minerals, final_gas)
-    else:
-        opponent = MEAT_WALLS[meat_level]
-        opponent_name = MEAT_WALLS_NAME[meat_level]
-        logger.info(f"Round {round}/{ROUNDS} hannibal vs {opponent_name}")
-        promoted = False
-        for i in range(PROMOTION_TRIES):
-            results = run_game(sc2.maps.get(np.random.choice(MAPS)), [hannibal, opponent], realtime=False, game_time_limit=TIMEOUT)
-            logger.debug(f"Promotion results: {results}")
+    mlflow.set_experiment(EXPERIMENT_NAME)
+    if mlflow.active_run() is not None:
+        mlflow.end_run()
+
+    mlflow.start_run()
+
+    hannibal_agent = StarAgent(train_mode=True, name="Hannibal", log_mlflow=True)
+    hannibal = Bot(Race.Zerg, hannibal_agent, name="Hannibal")
+    initial_checkpoint = CHKPT_DIR / f"hannibal_v{v}.pt"
+    hannibal_agent.save_checkpoint(initial_checkpoint)
+    versions.append(initial_checkpoint.name)
+    elo_ratings[hannibal.name] = ELO_INITIAL
+    elo_ratings[initial_checkpoint.name] = ELO_INITIAL
+
+    scipio_agent = StarAgent(train_mode=False, name="Scipio", log_mlflow=False)
+    scipio = Bot(Race.Zerg, scipio_agent, name="Scipio")
+
+    for round_num in range(1, ROUNDS + 1):
+        if should_stop:
+            logger.info("Stopping after current round completes.")
+            break
+
+        opponent_type = random.choices(
+            ["scipio", "scripted", "meatwall"],
+            weights=[0.7, 0.2, 0.1],
+        )[0]
+
+        map = map_rng.choice(maps)
+
+        if opponent_type == "scipio":
+            scipio_v = random.choice(versions)
+            scipio_agent.load_checkpoint(CHKPT_DIR / scipio_v)
+
+            hannibal_elo = elo_ratings.get(hannibal.name, ELO_INITIAL)
+            scipio_elo = elo_ratings.get(scipio_v, ELO_INITIAL)
+            logger.info(
+                f"Round {round_num}/{ROUNDS} hannibal vs {scipio_v} "
+                f"(ELO: {hannibal_elo:.0f} vs {scipio_elo:.0f})"
+            )
+            results = run_game(sc2.maps.get(map), [hannibal, scipio], realtime=False, game_time_limit=TIMEOUT)
             result = results[0] if isinstance(results, list) else results
-            game_duration = hannibal_agent.time
-            final_minerals = hannibal_agent.minerals
-            final_gas = hannibal_agent.vespene
-            logger.info(f"Round {round} Tryout {i+1}: {result.name} (duration: {game_duration:.0f}s)")
-            mlflow.log_metric("promotion_try", int(result == Result.Victory), step=i)
-            log_game_result(result, game_duration, final_minerals, final_gas)
-            if result == Result.Victory:
-                if meat_level < len(MEAT_WALLS) - 1:
-                    meat_level += 1
-                    logger.info(f"Promoting to next meat wall: {MEAT_WALLS_NAME[meat_level]}")
-                promoted = True
-                break
-        if not promoted:
-            logger.info(f"Did not win promotion tries; staying at {MEAT_WALLS_NAME[meat_level]}")
-        mlflow.log_metric("meat_level", meat_level)
 
-    if round % SAVE_EPISODES == 0:
-        v += 1
-        hannibal_agent.save_checkpoint(f"{CHKPT_DIR}/hannibal_v{v}.pt")
-        versions.append(f"hannibal_v{v}.pt")
-        mlflow.log_metric("checkpoint_version", v)
+            result = 1 if result == Result.Victory else (0.5 if result == Result.Tie else 0)
 
-    mlflow.log_metric("round", round)
-    
-    if round % EVAL_EPISODES == 0:
-        avg_duration = total_game_duration / games_played if games_played > 0 else 0
-        mlflow.log_metric("avg_game_duration", avg_duration)
-        logger.info(f"Round {round} summary: wins={wins} ties={ties} losses={losses} win_rate={wins/games_played:.2%} tie_rate={ties/games_played:.2%} avg_duration={avg_duration:.0f}s")
+            elo_ratings[hannibal.name] = update_elo(hannibal_elo, scipio_elo, result)
+            elo_ratings[scipio_v] = update_elo(scipio_elo, hannibal_elo, result)
 
-logger.info(f"Training complete. Final: wins={wins} ties={ties} losses={losses} win_rate={wins/games_played if games_played > 0 else 0:.2%} tie_rate={ties/games_played if games_played > 0 else 0:.2%}")
-mlflow.end_run()
+            logger.info(f"Result: {result}")
+
+            if result == 1:
+                stats["wins"] += 1
+            elif result == 0:
+                stats["losses"] += 1
+            else:
+                stats["ties"] += 1
+
+
+        elif opponent_type == "scripted":
+            race, bot_class = random.choice(SCRIPTED_BOTS)
+            opponent_name = f"{race.name}_{bot_class.__name__}"
+            opponent = Bot(race, bot_class(), name=opponent_name)
+
+            hannibal_elo = elo_ratings.get(hannibal.name, ELO_INITIAL)
+            scripted_elo = elo_ratings.get(opponent_name, ELO_INITIAL)
+            logger.info(
+                f"Round {round_num}/{ROUNDS} hannibal vs {opponent_name} "
+                f"(ELO: {hannibal_elo:.0f} vs {scripted_elo:.0f})"
+            )
+            results = run_game(sc2.maps.get(map), [hannibal, opponent], realtime=False, game_time_limit=TIMEOUT)
+            result = results[0] if isinstance(results, list) else results
+
+            result = 1 if result == Result.Victory else (0.5 if result == Result.Tie else 0)
+
+            elo_ratings[hannibal.name] = update_elo(hannibal_elo, scripted_elo, result)
+            elo_ratings[opponent_name] = update_elo(scripted_elo, hannibal_elo, result)
+
+            logger.info(f"Result: {result}")
+
+            if result == 1:
+                stats["wins"] += 1
+            elif result == 0:
+                stats["losses"] += 1
+            else:
+                stats["ties"] += 1
+
+        else:
+            opponent = MEAT_WALLS[meat_level]
+            opponent_name = MEAT_WALLS_NAME[meat_level]
+
+            hannibal_elo = elo_ratings.get(hannibal.name, ELO_INITIAL)
+            meatwall_elo = elo_ratings.get(opponent_name, ELO_INITIAL)
+            logger.info(
+                f"Round {round_num}/{ROUNDS} hannibal vs {opponent_name} "
+                f"(ELO: {hannibal_elo:.0f} vs {meatwall_elo:.0f})"
+            )
+            results = run_game(sc2.maps.get(map), [hannibal, opponent], realtime=False, game_time_limit=TIMEOUT)
+            result = results[0] if isinstance(results, list) else results
+
+            result = 1 if result == Result.Victory else (0.5 if result == Result.Tie else 0)
+
+            elo_ratings[hannibal.name] = update_elo(hannibal_elo, meatwall_elo, result)
+            elo_ratings[opponent_name] = update_elo(meatwall_elo, hannibal_elo, result)
+
+            logger.info(f"Result: {result}")
+
+            if result == 1:
+                stats["wins"] += 1
+                meat_level = (meat_level + 1) % len(MEAT_WALLS)
+            elif result == 0:
+                stats["losses"] += 1
+            else:
+                stats["ties"] += 1
+
+        metrics = hannibal_agent.get_performance_metrics()
+        scores = evaluate_agent(metrics)
+        logger.info(f"Performance: {scores}")
+        plot_radar_chart(scores, f"charts/performance_round_{round_num}.png")
+        mlflow.log_figure(plt.gcf(), f"charts/performance_round_{round_num}.png")
+        plt.close()
+
+        total = stats["wins"] + stats["losses"] + stats["ties"]
+        if total > 0:
+            win_rate = stats["wins"] / total
+            loss_rate = stats["losses"] / total
+            tie_rate = stats["ties"] / total
+        else:
+            win_rate = loss_rate = tie_rate = 0.0
+
+        hannibal_elo = elo_ratings.get(hannibal.name, ELO_INITIAL)
+
+        mlflow.log_metric("game/win_rate", win_rate, step=round_num)
+        mlflow.log_metric("game/loss_rate", loss_rate, step=round_num)
+        mlflow.log_metric("game/tie_rate", tie_rate, step=round_num)
+        mlflow.log_metric("game/elo_rating", hannibal_elo, step=round_num)
+
+        mlflow.log_metric("stats/total_wins", stats["wins"], step=round_num)
+        mlflow.log_metric("stats/total_losses", stats["losses"], step=round_num)
+        mlflow.log_metric("stats/total_ties", stats["ties"], step=round_num)
+
+        eco = metrics["economic"]
+        mlflow.log_metric("economic/mineral_collection_efficiency", eco["mineral_collection_efficiency"], step=round_num)
+        mlflow.log_metric("economic/vespene_collection_efficiency", eco["vespene_collection_efficiency"], step=round_num)
+        mlflow.log_metric("economic/idle_worker_time", eco["idle_worker_time"], step=round_num)
+        mlflow.log_metric("economic/idle_production_time", eco["idle_production_time"], step=round_num)
+
+        mil = metrics["military"]
+        mlflow.log_metric("military/total_damage_dealt", mil["total_damage_dealt"], step=round_num)
+        mlflow.log_metric("military/total_damage_taken", mil["total_damage_taken"], step=round_num)
+        mlflow.log_metric("military/damage_ratio", mil["damage_ratio"], step=round_num)
+        mlflow.log_metric("military/kill_value_ratio", mil["kill_value_ratio"], step=round_num)
+
+        res = metrics["resources"]
+        mlflow.log_metric("resources/total_resources_collected", res["total_resources_collected"], step=round_num)
+        mlflow.log_metric("resources/total_resources_spent", res["total_resources_spent"], step=round_num)
+        mlflow.log_metric("resources/resource_spending_rate", res["resource_spending_rate"], step=round_num)
+
+        prod = metrics["production"]
+        mlflow.log_metric("production/total_unit_value", prod["total_unit_value"], step=round_num)
+        mlflow.log_metric("production/total_structure_value", prod["total_structure_value"], step=round_num)
+        mlflow.log_metric("production/total_value_created", prod["total_value_created"], step=round_num)
+        mlflow.log_metric("production/value_lost_units", prod["value_lost_units"], step=round_num)
+        mlflow.log_metric("production/value_lost_structures", prod["value_lost_structures"], step=round_num)
+        mlflow.log_metric("production/net_value_retained", prod["net_value_retained"], step=round_num)
+
+        comp = metrics["composition"]
+        mlflow.log_metric("composition/workers", comp["workers"], step=round_num)
+        mlflow.log_metric("composition/army_count", comp["army_count"], step=round_num)
+        mlflow.log_metric("composition/structure_count", comp["structure_count"], step=round_num)
+        mlflow.log_metric("composition/supply_army", comp["supply_army"], step=round_num)
+        mlflow.log_metric("composition/supply_workers", comp["supply_workers"], step=round_num)
+        mlflow.log_metric("composition/supply_economy", comp["supply_economy"], step=round_num)
+        mlflow.log_metric("composition/supply_technology", comp["supply_technology"], step=round_num)
+
+        mlflow.log_metric("game/time", metrics["game_time"], step=round_num)
+
+        for key, value in metrics.get("cumulative", {}).items():
+            mlflow.log_metric(f"cumulative/{key}", value, step=round_num)
+            
+        if round_num % SAVE_EPISODES == 0:
+
+            v += 1
+            new_checkpoint = CHKPT_DIR / f"hannibal_v{v}.pt"
+            hannibal_agent.save_checkpoint(new_checkpoint)
+            prev_elo = elo_ratings.get(hannibal.name, ELO_INITIAL)
+            elo_ratings[new_checkpoint.name] = prev_elo
+            versions.append(new_checkpoint.name)
+            versions.sort(key=lambda key: elo_ratings.get(key, ELO_INITIAL), reverse=True)
+            versions = versions[:5]
+            mlflow.log_metric("checkpoint_version", v, round_num)
+            log_elo_artifact(elo_ratings)
+
+    if mlflow.active_run() is not None:
+        mlflow.end_run()
+
+
+if __name__ == "__main__":
+    main()

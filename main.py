@@ -3,7 +3,6 @@ import sc2
 from sc2.main import run_game
 from sc2.data import Difficulty, Race, Result
 from sc2.player import Bot, Computer
-from zerg_bots import CheeseZergBot
 from staragent import StarAgent
 
 MAP = "CeruleanFallLE"
@@ -13,8 +12,7 @@ RENDER = True
 TIMEOUT = 30 * 60  # 30 minutes
 
 ai = StarAgent(train_mode=False, log_mlflow=False)
-ai.load_checkpoint("checkpoints/hannibal_v29.pt")
-ai._log_level = 1
+ai.load_checkpoint("checkpoints/hannibal_v13.pt")
 star_bot = Bot(
     Race.Zerg, ai
 )

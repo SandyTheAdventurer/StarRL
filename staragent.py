@@ -21,17 +21,17 @@ class StarAgent(Scaffold):
         self,
         name: str = "StarAgent",
         log_mlflow: bool = False,
-        hidden_dim: int = 256,
+        hidden_dim: int = 384,
         n_layers: int = 5,
         n_lstm_layers: int = 1,
         out_channels: int = 64,
         gamma: float = 0.99,
-        lr: float = 3e-4,
-        lr_decay: float = 0.95,
+        lr: float = 1e-5,
+        lr_decay: float = 0.99,
         lr_decay_steps: int = 50,
-        entropy_coef: float = 0.01,
+        entropy_coef: float = 0.1,
         ppo_clip_eps: float = 0.2,
-        grad_clip_norm: float = 1.0,
+        grad_clip_norm: float = 0.5,
         train_mode: bool = True,
         action_interval: int = 8,
         rollout_horizon: int = 128,
@@ -402,7 +402,14 @@ class StarAgent(Scaffold):
 
     async def on_start(self):
         self._prev_metrics = self._collect_metrics()
+        self._prev_minerals = self.minerals
+        self._prev_time = self.time
         self._reset_lstm_state()
+        self._milestone_16_achieved = False
+        self._milestone_32_achieved = False
+        self._milestone_48_achieved = False
+        self._milestone_60_achieved = False
+        self.reset_cumulative_stats()
 
     async def on_step(self, iteration: int):
         # Always keep idle workers busy.
@@ -440,7 +447,7 @@ class StarAgent(Scaffold):
             log_prob = None
 
         action_ok = await self._execute_action(action_idx)
-        reward = self._compute_step_reward(action_ok)
+        reward = self._compute_step_reward(action_ok, action_idx)
         self._log_step(iteration, action_idx, action_ok, reward)
 
         if self.log_mlflow:
@@ -476,14 +483,16 @@ class StarAgent(Scaffold):
         self.episode_counter += 1
 
         terminal_reward = {
-            Result.Victory: 5.0,
-            Result.Defeat:  -5.0,
-        }.get(result, -2.5)
+            Result.Victory: 10.0,
+            Result.Defeat:  -10.0,
+        }.get(result, -5.0)
 
         if self.episode_rewards:
             self._finish_episode(terminal_reward=terminal_reward)
 
         self._log_episode_end(result, self._collect_metrics())
+
+        self.reset_cumulative_stats()
 
         if self.log_mlflow:
             mlflow.log_metric(f"{self.name}/episode/result", 1.0 if result == Result.Victory else 0.0, step=self.episode_counter)
