@@ -159,6 +159,7 @@ def main():
     v = 1
     versions = []
     elo_ratings = {}
+    recent_results = []
     stats = {
         "wins": 0,
         "ties": 0,
@@ -190,9 +191,11 @@ def main():
             logger.info("Stopping after current round completes.")
             break
 
+        pool_size = len(versions)
+        selfplay_weight = min(0.7, 0.3 + 0.04 * pool_size)
         opponent_type = random.choices(
             ["scipio", "scripted", "meatwall"],
-            weights=[0.7, 0.2, 0.1],
+            weights=[selfplay_weight, 1 - selfplay_weight - 0.2, 0.2],
         )[0]
 
         map = map_rng.choice(maps)
@@ -212,8 +215,11 @@ def main():
 
             result = 1 if result == Result.Victory else (0.5 if result == Result.Tie else 0)
 
+            recent_results.append(result)
+            if len(recent_results) > 10:
+                recent_results.pop(0)
+
             elo_ratings[hannibal.name] = update_elo(hannibal_elo, scipio_elo, result)
-            elo_ratings[scipio_v] = update_elo(scipio_elo, hannibal_elo, result)
 
             logger.info(f"Result: {result}")
 
@@ -240,6 +246,10 @@ def main():
             result = results[0] if isinstance(results, list) else results
 
             result = 1 if result == Result.Victory else (0.5 if result == Result.Tie else 0)
+
+            recent_results.append(result)
+            if len(recent_results) > 10:
+                recent_results.pop(0)
 
             elo_ratings[hannibal.name] = update_elo(hannibal_elo, scripted_elo, result)
             elo_ratings[opponent_name] = update_elo(scripted_elo, hannibal_elo, result)
@@ -268,6 +278,10 @@ def main():
 
             result = 1 if result == Result.Victory else (0.5 if result == Result.Tie else 0)
 
+            recent_results.append(result)
+            if len(recent_results) > 10:
+                recent_results.pop(0)
+
             elo_ratings[hannibal.name] = update_elo(hannibal_elo, meatwall_elo, result)
             elo_ratings[opponent_name] = update_elo(meatwall_elo, hannibal_elo, result)
 
@@ -275,9 +289,10 @@ def main():
 
             if result == 1:
                 stats["wins"] += 1
-                meat_level = (meat_level + 1) % len(MEAT_WALLS)
+                meat_level = min(meat_level + 1, len(MEAT_WALLS) - 1)
             elif result == 0:
                 stats["losses"] += 1
+                meat_level = max(meat_level - 1, 0)
             else:
                 stats["ties"] += 1
 
@@ -285,7 +300,6 @@ def main():
         scores = evaluate_agent(metrics)
         logger.info(f"Performance: {scores}")
         plot_radar_chart(scores, f"charts/performance_round_{round_num}.png")
-        mlflow.log_figure(plt.gcf(), f"charts/performance_round_{round_num}.png")
         plt.close()
 
         total = stats["wins"] + stats["losses"] + stats["ties"]
@@ -346,18 +360,24 @@ def main():
         for key, value in metrics.get("cumulative", {}).items():
             mlflow.log_metric(f"cumulative/{key}", value, step=round_num)
             
-        if round_num % SAVE_EPISODES == 0:
-
-            v += 1
-            new_checkpoint = CHKPT_DIR / f"hannibal_v{v}.pt"
-            hannibal_agent.save_checkpoint(new_checkpoint)
-            prev_elo = elo_ratings.get(hannibal.name, ELO_INITIAL)
-            elo_ratings[new_checkpoint.name] = prev_elo
-            versions.append(new_checkpoint.name)
-            versions.sort(key=lambda key: elo_ratings.get(key, ELO_INITIAL), reverse=True)
-            versions = versions[:5]
-            mlflow.log_metric("checkpoint_version", v, round_num)
-            log_elo_artifact(elo_ratings)
+        if round_num % SAVE_EPISODES == 0 and len(recent_results) > 0:
+            recent_winrate = sum(1 for r in recent_results if r == 1) / len(recent_results)
+            if recent_winrate >= 0.5:
+                v += 1
+                new_checkpoint = CHKPT_DIR / f"hannibal_v{v}.pt"
+                hannibal_agent.save_checkpoint(new_checkpoint)
+                prev_elo = elo_ratings.get(hannibal.name, ELO_INITIAL)
+                elo_ratings[new_checkpoint.name] = prev_elo
+                versions.append(new_checkpoint.name)
+                versions.sort(key=lambda key: elo_ratings.get(key, ELO_INITIAL), reverse=True)
+                top_versions = versions[:3]
+                old_versions = [ver for ver in versions if ver not in top_versions]
+                diversity_pick = random.sample(old_versions, min(2, len(old_versions))) if old_versions else []
+                versions = top_versions + diversity_pick
+                mlflow.log_metric("checkpoint_version", v, round_num)
+                log_elo_artifact(elo_ratings)
+    
+    hannibal_agent.save_checkpoint(CHKPT_DIR / f"hannibal_final.pt")
 
     if mlflow.active_run() is not None:
         mlflow.end_run()
