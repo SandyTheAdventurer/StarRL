@@ -109,7 +109,7 @@ class ZergRushBot(BotAI):
 
         # If we have no spawning pool, try to build spawning pool
         elif self.structures(UnitTypeId.SPAWNINGPOOL).amount + self.already_pending(UnitTypeId.SPAWNINGPOOL) == 0:
-            if self.can_afford(UnitTypeId.SPAWNINGPOOL):
+            if self.can_afford(UnitTypeId.SPAWNINGPOOL) and self.workers:
                 for d in range(4, 15):
                     pos: Point2 = hatch.position.towards(self.game_info.map_center, d)
                     if await self.can_place_single(UnitTypeId.SPAWNINGPOOL, pos):

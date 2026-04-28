@@ -3,6 +3,7 @@ import logging
 import random
 import signal
 import os
+os.environ["MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING"] = "true"
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -75,8 +76,8 @@ else:
 
 
 TIMEOUT = 30 * 60
-SAVE_EPISODES = 4
-ROUNDS = 200
+SAVE_EPISODES = 5
+ROUNDS = 300
 CHKPT_DIR = Path("checkpoints")
 MAPS_DIR = Path("StarCraftII/maps")
 ELO_RATINGS_PATH = Path("elo_ratings.json")
@@ -114,12 +115,10 @@ ELO_INITIAL = 1200
 
 SCRIPTED_BOTS = [
     (Race.Zerg, BanesBanesBanes),
-    (Race.Zerg, ExpandEverywhere),
     (Race.Zerg, Hydralisk),
     (Race.Zerg, BroodlordBot),
     (Race.Zerg, ZergRushBot),
     (Race.Protoss, CannonRushBot),
-    (Race.Protoss, FindAdeptShadesBot),
     (Race.Protoss, ThreebaseVoidrayBot),
     (Race.Protoss, WarpGateBot),
     (Race.Terran, CyclonePush),
@@ -160,6 +159,7 @@ def main():
     versions = []
     elo_ratings = {}
     recent_results = []
+    recent_selfplay_results = []
     stats = {
         "wins": 0,
         "ties": 0,
@@ -192,10 +192,10 @@ def main():
             break
 
         pool_size = len(versions)
-        selfplay_weight = min(0.7, 0.3 + 0.04 * pool_size)
+        selfplay_weight = min(0.6, 0.2 + 0.05 * pool_size)
         opponent_type = random.choices(
             ["scipio", "scripted", "meatwall"],
-            weights=[selfplay_weight, 1 - selfplay_weight - 0.2, 0.2],
+            weights=[selfplay_weight, 1 - selfplay_weight - 0.1, 0.1],
         )[0]
 
         map = map_rng.choice(maps)
@@ -218,8 +218,12 @@ def main():
             recent_results.append(result)
             if len(recent_results) > 10:
                 recent_results.pop(0)
+            recent_selfplay_results.append(result)
+            if len(recent_selfplay_results) > 10:
+                recent_selfplay_results.pop(0)
 
             elo_ratings[hannibal.name] = update_elo(hannibal_elo, scipio_elo, result)
+            elo_ratings[scipio_v] = update_elo(scipio_elo, hannibal_elo, 1 - result)
 
             logger.info(f"Result: {result}")
 
@@ -252,7 +256,7 @@ def main():
                 recent_results.pop(0)
 
             elo_ratings[hannibal.name] = update_elo(hannibal_elo, scripted_elo, result)
-            elo_ratings[opponent_name] = update_elo(scripted_elo, hannibal_elo, result)
+            elo_ratings[opponent_name] = update_elo(scripted_elo, hannibal_elo, 1-result)
 
             logger.info(f"Result: {result}")
 
@@ -283,7 +287,7 @@ def main():
                 recent_results.pop(0)
 
             elo_ratings[hannibal.name] = update_elo(hannibal_elo, meatwall_elo, result)
-            elo_ratings[opponent_name] = update_elo(meatwall_elo, hannibal_elo, result)
+            elo_ratings[opponent_name] = update_elo(meatwall_elo, hannibal_elo, 1-result)
 
             logger.info(f"Result: {result}")
 
@@ -356,13 +360,14 @@ def main():
         mlflow.log_metric("composition/supply_technology", comp["supply_technology"], step=round_num)
 
         mlflow.log_metric("game/time", metrics["game_time"], step=round_num)
-
+        mlflow.log_metric("training/round", round_num)
+        mlflow.log_metric("training/meat_level", meat_level, step=round_num)
         for key, value in metrics.get("cumulative", {}).items():
             mlflow.log_metric(f"cumulative/{key}", value, step=round_num)
             
-        if round_num % SAVE_EPISODES == 0 and len(recent_results) > 0:
-            recent_winrate = sum(1 for r in recent_results if r == 1) / len(recent_results)
-            if recent_winrate >= 0.5:
+        if round_num % SAVE_EPISODES == 0 and len(recent_selfplay_results) > 0:
+            recent_selfplay_winrate = sum(1 for r in recent_selfplay_results if r == 1) / len(recent_selfplay_results)
+            if recent_selfplay_winrate >= 0.5:
                 v += 1
                 new_checkpoint = CHKPT_DIR / f"hannibal_v{v}.pt"
                 hannibal_agent.save_checkpoint(new_checkpoint)
@@ -375,6 +380,7 @@ def main():
                 diversity_pick = random.sample(old_versions, min(2, len(old_versions))) if old_versions else []
                 versions = top_versions + diversity_pick
                 mlflow.log_metric("checkpoint_version", v, round_num)
+                mlflow.log_metric("game/recent_selfplay_winrate", recent_selfplay_winrate, step=round_num)
                 log_elo_artifact(elo_ratings)
     
     hannibal_agent.save_checkpoint(CHKPT_DIR / f"hannibal_final.pt")

@@ -76,34 +76,33 @@ class Scaffold(BotAI):
         # 56: unload nydus
         self.total_actions = 57
 
+        # Rebalanced rewards: scaled up to be meaningful relative to terminal
+        # reward of ±50. Shaped rewards should sum to ~50 over a full game.
         self._reward_weights = reward_weights or {
-            "workers": 0.01,
-            "army": 0.005,
-            "losses": -0.005,
-            "worker_loss": -0.002,
-            "success": 0.001,
-            "supply_penalty": -0.005,
-            "enemy_unit_kills": 0.02,
-            "enemy_structures_destroyed": 0.1,
-            "expansion": 0.02,
-            "resource_surplus": 0.001,
-            "structure_built": 0.001,
-            "low_worker_penalty": -0.01,
-            "income_rate": 0.02,
-            "worker_saturation": 0.005,
-            "workers_per_hatchery": 0.02,
-            "worker_milestone_16": 0.2,
-            "worker_milestone_32": 0.3,
-            "worker_milestone_48": 0.4,
-            "worker_milestone_60": 0.5,
-            "attack_action": 0.05,
-            "enemy_base_proximity": 0.02,
-            "army_movement": 0.005,
+            "workers": 0.05,                       # per-worker incremental reward (5x)
+            "army": 0.10,                          # per-army-unit incremental reward (5x)
+            "losses": -0.15,                       # penalize losses (5x)
+            "worker_loss": -0.10,
+            "success": 0.05,                       # bonus for successful actions (5x)
+            "supply_penalty": -0.10,
+            "enemy_unit_kills": 0.50,              # reward kills more strongly (5x)
+            "enemy_structures_destroyed": 2.50,    # structures matter more (5x)
+            "expansion": 0.50,
+            "structure_built": 0.10,
+            "low_worker_penalty": -0.05,
+            "worker_saturation": 0.025,
+            "workers_per_hatchery": 0.25,
+            "worker_milestone_32": 0.50,
+            "worker_milestone_60": 1.00,
+            "attack_action": 0.25,
+            "enemy_base_proximity": 0.25,
+            "army_movement": 0.05,
+            "queen_exists": 0.15,
         }
         self._log_level = log_level
         self.army_units = [UnitTypeId.ZERGLING, UnitTypeId.BANELING, UnitTypeId.HYDRALISK, UnitTypeId.MUTALISK, UnitTypeId.ROACH, UnitTypeId.CORRUPTOR, UnitTypeId.BROODLORD, UnitTypeId.ULTRALISK, UnitTypeId.INFESTOR, UnitTypeId.LURKERMP]
         self.worker_types = [UnitTypeId.DRONE, UnitTypeId.PROBE, UnitTypeId.SCV]
-        self.structure_types = [UnitTypeId.SPAWNINGPOOL, UnitTypeId.HYDRALISKDEN, UnitTypeId.SPIRE, UnitTypeId.ROACHWARREN, UnitTypeId.BANELINGNEST, UnitTypeId.INFESTATIONPIT, UnitTypeId.GREATERSPIRE, UnitTypeId.SPINECRAWLER, UnitTypeId.SPORECRAWLER, UnitTypeId.EVOLUTIONCHAMBER, UnitTypeId.ULTRALISKCAVERN, UnitTypeId.NYDUSCANAL, UnitTypeId.LURKERDEN, UnitTypeId.HATCHERY, UnitTypeId.LAIR, UnitTypeId.HIVE]
+        self.structure_types = [UnitTypeId.SPAWNINGPOOL, UnitTypeId.HYDRALISKDEN, UnitTypeId.SPIRE, UnitTypeId.ROACHWARREN, UnitTypeId.BANELINGNEST, UnitTypeId.INFESTATIONPIT, UnitTypeId.GREATERSPIRE, UnitTypeId.SPINECRAWLER, UnitTypeId.SPORECRAWLER, UnitTypeId.EVOLUTIONCHAMBER, UnitTypeId.ULTRALISKCAVERN, UnitTypeId.NYDUSCANAL, UnitTypeId.LURKERDENMP, UnitTypeId.HATCHERY, UnitTypeId.LAIR, UnitTypeId.HIVE]
         self._cumulative_stats = {
             "workers_created": 0,
             "army_units_created": 0,
@@ -112,10 +111,15 @@ class Scaffold(BotAI):
             "structures_lost": 0,
             "enemy_units_killed": 0,
             "enemy_structures_destroyed": 0,
+            "enemy_units_killed_value": 0.0,
+            "enemy_structures_destroyed_value": 0.0,
+            "units_lost_value": 0.0,
+            "structures_lost_value": 0.0,
         }
         self._prev_metrics = None
         self._prev_minerals = None
         self._prev_time = None
+        self._prev_score_cumulative = None
 
     def get_observation(self):
         target_h = self.observation_space[0][1]
@@ -395,6 +399,260 @@ class Scaffold(BotAI):
             return await self.unload_nydus()
         return False
 
+    def get_action_mask(self) -> torch.Tensor:
+        """Return a boolean mask where True = action is legal, False = illegal."""
+        mask = torch.ones(self.total_actions, dtype=torch.bool)
+        
+        has_pool = bool(self.structures(UnitTypeId.SPAWNINGPOOL).ready)
+        has_lair = bool(self.structures(UnitTypeId.LAIR).ready)
+        has_hive = bool(self.structures(UnitTypeId.HIVE).ready)
+        has_hydra_den = bool(self.structures(UnitTypeId.HYDRALISKDEN).ready)
+        has_spire = bool(self.structures(UnitTypeId.SPIRE).ready)
+        has_roach_warren = bool(self.structures(UnitTypeId.ROACHWARREN).ready)
+        has_baneling_nest = bool(self.structures(UnitTypeId.BANELINGNEST).ready)
+        has_infestation_pit = bool(self.structures(UnitTypeId.INFESTATIONPIT).ready)
+        has_greater_spire = bool(self.structures(UnitTypeId.GREATERSPIRE).ready)
+        has_ultralisk_cavern = bool(self.structures(UnitTypeId.ULTRALISKCAVERN).ready)
+        has_lurker_den = bool(self.structures(UnitTypeId.LURKERDENMP).ready)
+        has_nydus = bool(self.structures(UnitTypeId.NYDUSCANAL).ready)
+        has_overseer = bool(self.units(UnitTypeId.OVERSEER).ready)
+        has_overlord = bool(self.units(UnitTypeId.OVERLORD).ready)
+        has_larva = bool(self.larva)
+        has_hatchery = bool(self.townhalls.ready)
+        has_extractor = bool(self.structures(UnitTypeId.EXTRACTOR).ready)
+        has_workers = bool(self.workers)
+        has_army = bool(self.units.of_type(self.army_units).ready)
+        has_hydras = bool(self.units(UnitTypeId.HYDRALISK).ready)
+        has_queen = bool(self.units(UnitTypeId.QUEEN).ready)
+        has_zergling = bool(self.units(UnitTypeId.ZERGLING).ready)
+        
+        can_afford_pool = self.can_afford(UnitTypeId.SPAWNINGPOOL)
+        can_afford_lair = self.can_afford(UnitTypeId.LAIR)
+        
+        # 0: no-op — always valid
+        
+        # 1: build spawning pool
+        if has_pool or not has_hatchery or not can_afford_pool:
+            mask[1] = False
+        
+        # 2: train zerglings
+        if not has_pool or not has_larva:
+            mask[2] = False
+        
+        # 3: attack
+        if not has_army:
+            mask[3] = False
+        
+        # 4: train drones
+        if not has_larva:
+            mask[4] = False
+        
+        # 5: train overlord
+        if not has_larva:
+            mask[5] = False
+        
+        # 6: train hydralisk (anti-air)
+        if not has_hydra_den or not has_larva:
+            mask[6] = False
+        
+        # 7: train mutalisk (flying)
+        if not has_spire or not has_larva:
+            mask[7] = False
+        
+        # 8: build hydralisk den
+        if has_hydra_den or not has_lair:
+            mask[8] = False
+        
+        # 9: build spire
+        if has_spire or not has_lair:
+            mask[9] = False
+        
+        # 10: build roach warren
+        if has_roach_warren or not has_pool:
+            mask[10] = False
+        
+        # 11: train roach
+        if not has_roach_warren or not has_larva:
+            mask[11] = False
+        
+        # 12: build baneling nest
+        if has_baneling_nest or not has_pool:
+            mask[12] = False
+        
+        # 13: train baneling
+        if not has_baneling_nest or not has_larva or not has_zergling:
+            mask[13] = False
+        
+        # 14: build infestation pit
+        if has_infestation_pit or not has_lair:
+            mask[14] = False
+        
+        # 15: build greater spire
+        if has_greater_spire or not has_spire or not has_hive:
+            mask[15] = False
+        
+        # 16: train brood lord
+        if not has_greater_spire or not has_larva:
+            mask[16] = False
+        
+        # 17: build spine crawler
+        if not has_hatchery or not has_workers:
+            mask[17] = False
+        
+        # 18: build spore crawler
+        if not has_hatchery or not has_workers:
+            mask[18] = False
+        
+        # 19: inject larva
+        if not has_queen:
+            mask[19] = False
+        
+        # 20: spread creep
+        if not has_queen:
+            mask[20] = False
+        
+        # 21: transfuse
+        if not has_queen:
+            mask[21] = False
+        
+        # 22: research zergling speed
+        if not has_pool:
+            mask[22] = False
+        
+        # 23: research burrow
+        if not has_lair:
+            mask[23] = False
+        
+        # 24: research roach speed
+        if not has_roach_warren:
+            mask[24] = False
+        
+        # 25: research baneling speed
+        if not has_baneling_nest:
+            mask[25] = False
+        
+        # 26: research flyer attacks
+        if not has_spire:
+            mask[26] = False
+        
+        # 27: retreat
+        if not has_army:
+            mask[27] = False
+        
+        # 28: regroup
+        if not has_army:
+            mask[28] = False
+        
+        # 29: focus fire
+        if not has_army:
+            mask[29] = False
+        
+        # 30: morph to lair
+        if has_lair or has_hive or not has_pool or not can_afford_lair:
+            mask[30] = False
+        
+        # 31: morph to greater spire
+        if has_greater_spire or not has_spire or not has_hive:
+            mask[31] = False
+        
+        # 32: send drone to minerals
+        if not has_workers or not self.mineral_field:
+            mask[32] = False
+        
+        # 33: send drone to gas
+        if not has_workers or not has_extractor:
+            mask[33] = False
+        
+        # 34: explore with zergling
+        if not has_zergling:
+            mask[34] = False
+        
+        # 35: build extractor
+        if has_extractor or not has_hatchery or not has_workers:
+            mask[35] = False
+        
+        # 36: expand
+        if not self.can_afford(UnitTypeId.HATCHERY):
+            mask[36] = False
+        
+        # 37: gather vespene
+        if not has_extractor or not has_workers:
+            mask[37] = False
+        
+        # 38: gather minerals
+        if not has_workers or not self.mineral_field:
+            mask[38] = False
+        
+        # 39: maintain worker economy — always valid
+        
+        # 40: ensure overlord buffer — always valid
+        
+        # 41: flood zerglings
+        if not has_pool or not has_larva:
+            mask[41] = False
+        
+        # 42: train queen
+        if not has_pool or not has_hatchery:
+            mask[42] = False
+        
+        # 43: train ultralisk
+        if not has_ultralisk_cavern or not has_larva:
+            mask[43] = False
+        
+        # 44: train infestor
+        if not has_infestation_pit or not has_larva:
+            mask[44] = False
+        
+        # 45: train lurker
+        if not has_lurker_den or not has_hydras:
+            mask[45] = False
+        
+        # 46: build evolution chamber
+        if self.structures(UnitTypeId.EVOLUTIONCHAMBER).exists or not has_pool:
+            mask[46] = False
+        
+        # 47: build ultralisk cavern
+        if has_ultralisk_cavern or not has_hive:
+            mask[47] = False
+        
+        # 48: build nydus canal
+        if has_nydus or not has_hive:
+            mask[48] = False
+        
+        # 49: build lurker den
+        if has_lurker_den or not has_lair:
+            mask[49] = False
+        
+        # 50: research ground armor
+        if not self.structures(UnitTypeId.EVOLUTIONCHAMBER).ready:
+            mask[50] = False
+        
+        # 51: research air armor
+        if not self.structures(UnitTypeId.EVOLUTIONCHAMBER).ready:
+            mask[51] = False
+        
+        # 52: research neural parasite
+        if not has_infestation_pit:
+            mask[52] = False
+        
+        # 53: build overseer
+        if has_overseer or not has_overlord or (not has_lair and not has_hive):
+            mask[53] = False
+        
+        # 54: spawn changeling
+        if not has_overseer:
+            mask[54] = False
+        
+        # 55: load nydus
+        if not has_nydus or not has_army:
+            mask[55] = False
+        
+        # 56: unload nydus
+        if not has_nydus:
+            mask[56] = False
+        
+        return mask
+
     async def build_hydralisk_den(self):
         if self.structures(UnitTypeId.HYDRALISKDEN).exists:
             return False
@@ -514,12 +772,12 @@ class Scaffold(BotAI):
         for _ in range(max(1, n)):
             if not self.can_afford(UnitTypeId.QUEEN):
                 break
-            available_larva = self.larva.filter(lambda l: l.tag not in self.unit_tags_received_action)
-            if not available_larva:
+            if self.already_pending(UnitTypeId.QUEEN) >= self.townhalls.amount:
                 break
-            larva = available_larva.random
-            self.do(larva.train(UnitTypeId.QUEEN))
-            issued = True
+            for hatchery in self.townhalls.ready:
+                self.do(hatchery.train(UnitTypeId.QUEEN))
+                issued = True
+                break
         return issued
 
     async def train_ultralisk(self, n: int = 1) -> bool:
@@ -583,8 +841,11 @@ class Scaffold(BotAI):
             return False
         if not self.structures(UnitTypeId.LAIR).ready and not self.structures(UnitTypeId.HIVE).ready:
             return False
-        hatch = (self.structures(UnitTypeId.LAIR).ready or self.structures(UnitTypeId.HIVE).ready).first
-        self.do(hatch.train(UnitTypeId.OVERSEER))
+        overlords = self.units(UnitTypeId.OVERLORD).ready.idle
+        if not overlords:
+            return False
+        overlord = overlords.first
+        self.do(overlord(AbilityId.MORPH_OVERSEER))
         return True
 
     async def spawn_changeling(self) -> bool:
@@ -593,7 +854,13 @@ class Scaffold(BotAI):
             return False
         overseer = overseers.first
         if overseer.energy >= 50:
-            self.do(overseer(AbilityId.SPAWNCHANGELING_CHANGELING))
+            # Ability enum name differs across python-sc2 versions.
+            ability = getattr(AbilityId, "SPAWNCHANGELING_SPAWNCHANGELING", None)
+            if ability is None:
+                ability = getattr(AbilityId, "SPAWNCHANGELING_CHANGELING", None)
+            if ability is None:
+                return False
+            self.do(overseer(ability))
             return True
         return False
 
@@ -634,7 +901,8 @@ class Scaffold(BotAI):
         lost_army = float(getattr(score, "lost_minerals_army", 0.0)) + float(getattr(score, "lost_vespene_army", 0.0))
         lost_workers = float(getattr(score, "lost_minerals_economy", 0.0)) + float(getattr(score, "lost_vespene_economy", 0.0))
         
-        hatcheries = float(self.structures(UnitTypeId.HATCHERY).amount + self.structures(UnitTypeId.LAIR).amount + self.structures(UnitTypeId.HIVE).amount)
+        # Use race-agnostic townhall count to avoid bias for non-Zerg bots.
+        hatcheries = float(self.townhalls.amount)
         
         supply_used = self.supply_used
         supply_cap = self.supply_cap
@@ -642,6 +910,8 @@ class Scaffold(BotAI):
         return {
             "workers": float(self.workers.amount),
             "army": float(army_count),
+            "minerals": float(self.minerals),
+            "gas": float(self.vespene),
             "enemy_unit_kills": enemy_kills,
             "enemy_structures_destroyed": structure_kills,
             "lost_army": lost_army,
@@ -655,6 +925,7 @@ class Scaffold(BotAI):
 
     def _compute_step_reward(self, action_succeeded: bool, action_idx: int = -1) -> float:
         current = self._collect_metrics()
+        self._sync_cumulative_score_fallback()
         if self._prev_metrics is None:
             self._prev_metrics = current
             self._prev_minerals = self.minerals
@@ -688,24 +959,17 @@ class Scaffold(BotAI):
         if action_succeeded:
             reward += w.get("success", 0)
 
-        # Normalize income rate consistently with observation preprocessing
-        income_rate_norm = 0.0
-        if self._prev_minerals is not None and self._prev_time is not None and self.time > self._prev_time:
-            dt = self.time - self._prev_time
-            income_rate_norm = min((self.minerals - self._prev_minerals) / max(dt, 0.1), 1000) / 1000.0
-        reward += w.get("income_rate", 0) * income_rate_norm
+        if self.units(UnitTypeId.QUEEN).ready:
+            reward += w.get("queen_exists", 0)
 
-        # Use normalized mineral reserve (matches get_observation scaling) to avoid raw hoarding incentive
-        resource_surplus_norm = min(self.minerals / 1500.0, 1.0)
-        reward += w.get("resource_surplus", 0) * resource_surplus_norm
-
-        # Penalize deviation from ideal worker saturation (both under- and over-staffing)
+        # Penalize deviation from ideal worker saturation, with a deadzone
+        # to avoid constant negative baseline when near target.
         ideal_workers = current.get("hatcheries", 0) * 16
         saturation_gap = abs(current.get("workers", 0) - ideal_workers)
         if ideal_workers > 0:
-            saturation_penalty = saturation_gap / float(max(1.0, ideal_workers))
+            saturation_penalty = max(0.0, saturation_gap - 2.0) / float(max(1.0, ideal_workers))
         else:
-            saturation_penalty = saturation_gap
+            saturation_penalty = 0.0
         reward -= w.get("worker_saturation", 0) * saturation_penalty
 
         target_workers_per_base = 16
@@ -723,7 +987,7 @@ class Scaffold(BotAI):
         if current["workers"] < 5 and current["hatcheries"] >= 1:
             reward += w["low_worker_penalty"]
 
-        if self.supply_left <= 0:
+        if self.supply_left <= 0 and self.supply_cap > 0:
             reward += w["supply_penalty"]
 
         enemy_base = self.enemy_start_locations[0] if self.enemy_start_locations else None
@@ -742,15 +1006,10 @@ class Scaffold(BotAI):
                 reward += w["army_movement"]
 
         wn = current["workers"]
-        if wn >= 16 and not getattr(self, '_milestone_16_achieved', False):
-            self._milestone_16_achieved = True
-            reward += w.get("worker_milestone_16", 0)
+        # Reduced milestone set: keep only larger, meaningful milestones
         if wn >= 32 and not getattr(self, '_milestone_32_achieved', False):
             self._milestone_32_achieved = True
             reward += w.get("worker_milestone_32", 0)
-        if wn >= 48 and not getattr(self, '_milestone_48_achieved', False):
-            self._milestone_48_achieved = True
-            reward += w.get("worker_milestone_48", 0)
         if wn >= 60 and not getattr(self, '_milestone_60_achieved', False):
             self._milestone_60_achieved = True
             reward += w.get("worker_milestone_60", 0)
@@ -758,8 +1017,39 @@ class Scaffold(BotAI):
         self._prev_metrics = current
         self._prev_minerals = self.minerals
         self._prev_time = self.time
-        # Relax final clipping to preserve useful gradient information
-        return float(max(-1.0, min(1.0, reward)))
+        # No clipping: return raw shaped reward to preserve full signal
+        return float(reward)
+
+    def _sync_cumulative_score_fallback(self):
+        """Update value-based cumulative stats from score deltas.
+
+        This is a resilient fallback for matches where unit-destroyed callbacks
+        may miss some deaths (e.g. fog-of-war or API visibility timing).
+        """
+        score = self.state.score
+        current_score_totals = {
+            "enemy_units_killed_value": float(getattr(score, "killed_minerals_units", 0.0))
+            + float(getattr(score, "killed_vespene_units", 0.0)),
+            "enemy_structures_destroyed_value": float(getattr(score, "killed_minerals_structures", 0.0))
+            + float(getattr(score, "killed_vespene_structures", 0.0)),
+            "units_lost_value": float(getattr(score, "lost_minerals_army", 0.0))
+            + float(getattr(score, "lost_vespene_army", 0.0))
+            + float(getattr(score, "lost_minerals_economy", 0.0))
+            + float(getattr(score, "lost_vespene_economy", 0.0)),
+            "structures_lost_value": float(getattr(score, "lost_minerals_technology", 0.0))
+            + float(getattr(score, "lost_vespene_technology", 0.0)),
+        }
+
+        if self._prev_score_cumulative is None:
+            self._prev_score_cumulative = current_score_totals
+            return
+
+        for key, total in current_score_totals.items():
+            prev_total = float(self._prev_score_cumulative.get(key, 0.0))
+            delta = max(0.0, total - prev_total)
+            self._cumulative_stats[key] = float(self._cumulative_stats.get(key, 0.0)) + delta
+
+        self._prev_score_cumulative = current_score_totals
 
     def _log_step(self, iteration: int, action: int, succeeded: bool, reward: float):
         if self._log_level < 1:
@@ -824,43 +1114,44 @@ class Scaffold(BotAI):
     async def build_spawning_pool(self) -> bool:
         if self.structures(UnitTypeId.SPAWNINGPOOL):
             return False
-        if not self.structures(UnitTypeId.HATCHERY).ready:
+        if not self.townhalls.ready:
             return False
         if not self.can_afford(UnitTypeId.SPAWNINGPOOL):
             return False
-        hatch = self.structures(UnitTypeId.HATCHERY).ready.first
-        pos = hatch.position.towards(self.game_info.map_center, 5)
+        townhall = self.townhalls.ready.first
+        pos = townhall.position.towards(self.game_info.map_center, 5)
         return await self.build(UnitTypeId.SPAWNINGPOOL, near=pos)
 
     async def build_evolution_chamber(self) -> bool:
         if self.structures(UnitTypeId.EVOLUTIONCHAMBER):
             return False
-        if not self.structures(UnitTypeId.HATCHERY).ready:
+        if not self.townhalls.ready:
             return False
         if not self.can_afford(UnitTypeId.EVOLUTIONCHAMBER):
             return False
-        hatch = self.structures(UnitTypeId.HATCHERY).ready.first
-        pos = hatch.position.towards(self.game_info.map_center, 5)
+        townhall = self.townhalls.ready.first
+        pos = townhall.position.towards(self.game_info.map_center, 5)
         return await self.build(UnitTypeId.EVOLUTIONCHAMBER, near=pos)
 
     async def build_ultralisk_cavern(self) -> bool:
         if self.structures(UnitTypeId.ULTRALISKCAVERN):
             return False
-        if not self.structures(UnitTypeId.LAIR).ready:
+        if not self.structures(UnitTypeId.HIVE).ready:
             return False
         if not self.can_afford(UnitTypeId.ULTRALISKCAVERN):
             return False
-        lair = self.structures(UnitTypeId.LAIR).ready.first
-        pos = lair.position.towards(self.game_info.map_center, 5)
+        hive = self.structures(UnitTypeId.HIVE).ready.first
+        pos = hive.position.towards(self.game_info.map_center, 5)
         return await self.build(UnitTypeId.ULTRALISKCAVERN, near=pos)
 
     async def build_nydus_canal(self) -> bool:
-        if self.can_afford(UnitTypeId.NYDUSCANAL):
-            if self.structures(UnitTypeId.HATCHERY).ready:
-                hatch = self.structures(UnitTypeId.HATCHERY).ready.first
-                pos = hatch.position.towards(self.game_info.map_center, 5)
-                return await self.build(UnitTypeId.NYDUSCANAL, near=pos)
-        return False
+        if not self.can_afford(UnitTypeId.NYDUSCANAL):
+            return False
+        if not self.townhalls.ready:
+            return False
+        townhall = self.townhalls.ready.first
+        pos = townhall.position.towards(self.game_info.map_center, 5)
+        return await self.build(UnitTypeId.NYDUSCANAL, near=pos)
 
     async def build_lurker_den(self) -> bool:
         if self.structures(UnitTypeId.LURKERDENMP).exists:
@@ -876,16 +1167,18 @@ class Scaffold(BotAI):
     async def build_roach_warren(self) -> bool:
         if self.structures(UnitTypeId.ROACHWARREN).exists:
             return False
-        if not self.structures(UnitTypeId.LAIR).ready:
+        if not self.structures(UnitTypeId.SPAWNINGPOOL).ready:
             return False
         if not self.can_afford(UnitTypeId.ROACHWARREN):
             return False
-        lair = self.structures(UnitTypeId.LAIR).ready.first
-        pos = lair.position.towards(self.game_info.map_center, 5)
+        if not self.townhalls.ready:
+            return False
+        townhall = self.townhalls.ready.first
+        pos = townhall.position.towards(self.game_info.map_center, 5)
         return await self.build(UnitTypeId.ROACHWARREN, near=pos)
     
     async def attack_move(self, target: Point2 | None = None) -> bool:
-        army = self.units.of_type({UnitTypeId.ZERGLING, UnitTypeId.BANELING})
+        army = self.units.of_type(set(self.army_units)).ready
         if not army:
             return False
 
@@ -913,12 +1206,14 @@ class Scaffold(BotAI):
     async def build_baneling_nest(self) -> bool:
         if self.structures(UnitTypeId.BANELINGNEST):
             return False
-        if not self.structures(UnitTypeId.LAIR).ready:
+        if not self.structures(UnitTypeId.SPAWNINGPOOL).ready:
             return False
         if not self.can_afford(UnitTypeId.BANELINGNEST):
             return False
-        lair = self.structures(UnitTypeId.LAIR).ready.first
-        pos = lair.position.towards(self.game_info.map_center, 5)
+        if not self.townhalls.ready:
+            return False
+        townhall = self.townhalls.ready.first
+        pos = townhall.position.towards(self.game_info.map_center, 5)
         return await self.build(UnitTypeId.BANELINGNEST, near=pos)
 
     async def build_infestation_pit(self) -> bool:
@@ -967,10 +1262,10 @@ class Scaffold(BotAI):
             return False
         if not self.can_afford(UnitTypeId.SPINECRAWLER):
             return False
-        if not self.structures(UnitTypeId.HATCHERY).ready:
+        if not self.townhalls.ready:
             return False
-        hatch = self.structures(UnitTypeId.HATCHERY).ready.first
-        pos = hatch.position.towards(self.game_info.map_center, 7)
+        townhall = self.townhalls.ready.first
+        pos = townhall.position.towards(self.game_info.map_center, 7)
         return await self.build(UnitTypeId.SPINECRAWLER, near=pos)
 
     async def build_spore_crawler(self) -> bool:
@@ -979,10 +1274,10 @@ class Scaffold(BotAI):
             return False
         if not self.can_afford(UnitTypeId.SPORECRAWLER):
             return False
-        if not self.structures(UnitTypeId.HATCHERY).ready:
+        if not self.townhalls.ready:
             return False
-        hatch = self.structures(UnitTypeId.HATCHERY).ready.first
-        pos = hatch.position.towards(self.game_info.map_center, 7)
+        townhall = self.townhalls.ready.first
+        pos = townhall.position.towards(self.game_info.map_center, 7)
         return await self.build(UnitTypeId.SPORECRAWLER, near=pos)
 
     async def inject_larva(self) -> bool:
@@ -1018,9 +1313,9 @@ class Scaffold(BotAI):
         return False
 
     async def research_burrow(self) -> bool:
-        if self.structures(UnitTypeId.HATCHERY).ready:
-            hatch = self.structures(UnitTypeId.HATCHERY).ready.first
-            self.do(hatch.research(UpgradeId.BURROW))
+        if self.townhalls.ready:
+            townhall = self.townhalls.ready.first
+            self.do(townhall.research(UpgradeId.BURROW))
             return True
         return False
 
@@ -1304,6 +1599,7 @@ class Scaffold(BotAI):
         return issued
     
     def get_performance_metrics(self) -> dict:  
+        self._sync_cumulative_score_fallback()
         score = self.state.score  
         
         economic_metrics = {
@@ -1381,7 +1677,10 @@ class Scaffold(BotAI):
     async def on_unit_destroyed(self, unit_tag: int):  
         await super().on_unit_destroyed(unit_tag)  
         
-        unit = self._all_units_previous_map.get(unit_tag)  
+        unit_map = getattr(self, "_all_units_previous_map", None)
+        if unit_map is None:
+            return
+        unit = unit_map.get(unit_tag)  
         if not unit:  
             return
         
@@ -1405,11 +1704,16 @@ class Scaffold(BotAI):
             "enemy_structures_destroyed": 0,
             "units_lost": 0,
             "structures_lost": 0,
+            "enemy_units_killed_value": 0.0,
+            "enemy_structures_destroyed_value": 0.0,
+            "units_lost_value": 0.0,
+            "structures_lost_value": 0.0,
         }
         # Reset bookkeeping and milestones used for reward shaping
         self._prev_metrics = None
         self._prev_minerals = None
         self._prev_time = None
+        self._prev_score_cumulative = None
         self._milestone_16_achieved = False
         self._milestone_32_achieved = False
         self._milestone_48_achieved = False

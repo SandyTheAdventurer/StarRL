@@ -6,41 +6,59 @@ import numpy as np
 from matplotlib import pyplot as plt
 from torch.distributions import Normal, Categorical, Bernoulli
 
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _saturating_score(value: float, scale: float) -> float:
+    if value <= 0:
+        return 0.0
+    return value / (value + scale)
+
+
 def evaluate_agent(metrics: dict) -> dict:
-    time_min = max(metrics['game_time'] / 60, 1)
-    
-    eco = metrics['economic']
+    time_min = max(metrics.get("game_time", 0.0) / 60.0, 1.0)
+
+    eco = metrics["economic"]
+    mil = metrics["military"]
+    res = metrics["resources"]
+    prod = metrics["production"]
+
+    mineral_eff = _clamp(eco.get("mineral_collection_efficiency", 0.0), 0.0, 5.0) / 5.0
+    idle_worker_rate = _clamp(eco.get("idle_worker_time", 0.0) / time_min, 0.0, 60.0)
+    idle_prod_rate = _clamp(eco.get("idle_production_time", 0.0) / time_min, 0.0, 60.0)
+
     eco_pts = (
-        (min(eco['mineral_collection_efficiency'], 5) / 5 * 10) +
-        (max(10 - (eco['idle_worker_time'] / time_min), 0) * 2) +
-        (max(10 - (eco['idle_production_time'] / time_min), 0) * 2)
-    )
-    
-    mil = metrics['military']
-    mil_pts = (
-        (min(mil['damage_ratio'], 2) / 2 * 20) +
-        (min(mil['kill_value_ratio'], 1.5) / 1.5 * 20)
-    )
-    
-    res = metrics['resources']
-    prod = metrics['production']
-    macro_pts = (
-        (res['resource_spending_rate'] * 15) +
-        (min(prod['net_value_retained'] / 5000, 1) * 15)
+        mineral_eff * 40.0
+        + (1.0 - idle_worker_rate / 60.0) * 30.0
+        + (1.0 - idle_prod_rate / 60.0) * 30.0
     )
 
-    prod_pts = (
-        (min(prod['total_value_created'] / 5000, 1) * 15) +
-        (min(prod['net_value_retained'] / 5000, 1) * 15) +
-        (min(prod['value_lost_structures'] / 1000, 1) * 10) +
-        (20 if prod['total_structure_value'] > 0 else 0)
+    damage_ratio = _clamp(mil.get("damage_ratio", 0.0), 0.0, 3.0) / 3.0
+    kill_value_ratio = _clamp(mil.get("kill_value_ratio", 0.0), 0.0, 2.0) / 2.0
+    damage_per_min = (mil.get("total_damage_dealt", 0.0) / time_min)
+    damage_rate_score = _saturating_score(damage_per_min, 500.0)
+
+    mil_pts = (
+        damage_ratio * 40.0
+        + kill_value_ratio * 40.0
+        + damage_rate_score * 20.0
     )
+
+    spending_rate = _clamp(res.get("resource_spending_rate", 0.0), 0.0, 1.2) / 1.2
+    retained_score = _saturating_score(prod.get("net_value_retained", 0.0), 4000.0)
+    macro_pts = spending_rate * 60.0 + retained_score * 40.0
+
+    created_score = _saturating_score(prod.get("total_value_created", 0.0), 5000.0)
+    structure_score = _saturating_score(prod.get("total_structure_value", 0.0), 1500.0)
+    loss_penalty = _clamp(prod.get("value_lost_structures", 0.0) / 2000.0, 0.0, 1.0)
+    prod_pts = created_score * 45.0 + structure_score * 35.0 + (1.0 - loss_penalty) * 20.0
 
     scores = {
-        "economic_score": round(eco_pts, 2),
-        "military_score": round(mil_pts, 2),
-        "macro_score": round(macro_pts, 2),
-        "production_score": round(prod_pts, 2)
+        "economic_score": round(_clamp(eco_pts, 0.0, 100.0), 2),
+        "military_score": round(_clamp(mil_pts, 0.0, 100.0), 2),
+        "macro_score": round(_clamp(macro_pts, 0.0, 100.0), 2),
+        "production_score": round(_clamp(prod_pts, 0.0, 100.0), 2),
     }
     return scores
 
@@ -49,31 +67,39 @@ def update_elo(player_elo, opponent_elo, actual_score, elo_k = 32):
     return player_elo + elo_k * (actual_score - expected)
 
 def plot_radar_chart(scores: dict, output_path: str = "performance_radar.png"):
-    categories = ['Economic', 'Military', 'Macro', 'Production']
+    categories = ["Economic", "Military", "Macro", "Production"]
     values = [
-        scores['economic_score'], 
-        scores['military_score'], 
-        scores['macro_score'],
-        scores.get('production_score', 0) 
+        scores.get("economic_score", 0.0),
+        scores.get("military_score", 0.0),
+        scores.get("macro_score", 0.0),
+        scores.get("production_score", 0.0),
     ]
-    
+
     N = len(categories)
-    
     angles = [n / float(N) * 2 * np.pi for n in range(N)]
     angles += angles[:1]
     values += values[:1]
-    
-    fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
-    
-    plt.xticks(angles[:-1], categories)
-    
-    ax.plot(angles, values, linewidth=2, linestyle='solid')
-    ax.fill(angles, values, 'b', alpha=0.1)
-    
+
+    fig, ax = plt.subplots(figsize=(6.5, 6.5), subplot_kw=dict(polar=True))
+
+    ax.set_theta_offset(np.pi / 2)
+    ax.set_theta_direction(-1)
+    ax.set_rlabel_position(0)
+
     ax.set_ylim(0, 100)
-    
-    plt.title("Agent Performance Profile", size=15, y=1.1)
-    plt.savefig(output_path)
+    ax.set_yticks([20, 40, 60, 80, 100])
+    ax.set_yticklabels(["20", "40", "60", "80", "100"], color="#666666", size=9)
+    ax.grid(color="#dddddd", linewidth=0.8)
+
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(categories, fontsize=10)
+
+    ax.plot(angles, values, linewidth=2, linestyle="solid", color="#1f77b4")
+    ax.fill(angles, values, color="#1f77b4", alpha=0.15)
+
+    plt.title("Agent Performance Profile", size=14, y=1.08)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
     plt.close()
 
 class MLP(nn.Module):
