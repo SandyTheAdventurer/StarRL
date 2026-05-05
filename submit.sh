@@ -1,0 +1,1 @@
+zip -r hannibal.zip /home/sandy/.local/lib/python3.14/site-packages/sc2 ladder.py ladderbots.json run.py bot.py staragent.py utils.py scaffold.py checkpoints/hannibal_p1_v10.pt
