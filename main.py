@@ -3,22 +3,27 @@ import sc2
 from sc2.main import run_game
 from sc2.data import Difficulty, Race, Result
 from sc2.player import Bot, Computer
+from bots.zerg.onebase_broodlord import BroodlordBot as ZergBot
 from staragent import StarAgent
 
 MAP = "CeruleanFallLE"
 EPISODES = 1
-difficulty = Difficulty.Medium
+difficulty = Difficulty.Hard
 RENDER = True
 TIMEOUT = 30 * 60  # 30 minutes
 
-ai = StarAgent(train_mode=False, log_mlflow=False)
-ai.load_checkpoint("checkpoints/hannibal_v13.pt")
+ai = StarAgent(train_mode=False, log_mlflow=False, compile_model=True)
+ai.load_checkpoint("checkpoints/hannibal_p1_v10.pt")
+zerg_ai = ZergBot()
 star_bot = Bot(
     Race.Zerg, ai
 )
+zerg_bot = Bot(
+    Race.Zerg, zerg_ai
+)
 
+bot2 = Computer(Race.Random, difficulty)
 bot = Computer(Race.Random, difficulty)
-
 for episode in range(1, EPISODES + 1):
     print(f"\n=== Episode {episode}/{EPISODES} ===")
     result = run_game(

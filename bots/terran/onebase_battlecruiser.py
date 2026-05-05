@@ -26,7 +26,10 @@ class BCRushBot(BotAI):
         if self.units and min(u.position.distance_to(self.enemy_start_locations[0]) for u in self.units) < 5:
             return self.enemy_start_locations[0].position, False
 
-        return self.mineral_field.random.position, False
+        if self.mineral_field:
+            return self.mineral_field.random.position, False
+
+        return self.game_info.map_center, False
 
     async def on_step(self, iteration: int):
         ccs: Units = self.townhalls

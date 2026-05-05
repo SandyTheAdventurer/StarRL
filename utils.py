@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import math
 from pathlib import Path
 from typing import Any
 import numpy as np
@@ -23,6 +24,17 @@ def evaluate_agent(metrics: dict) -> dict:
     mil = metrics["military"]
     res = metrics["resources"]
     prod = metrics["production"]
+    avg = metrics.get("averages", {})
+
+    avg_income = _clamp(avg.get("income_rate", 0.0), 0.0, 1.0)
+    avg_workers = _clamp(avg.get("workers", 0.0), 0.0, 60.0) / 60.0
+    avg_supply_used = float(avg.get("supply_used", 0.0))
+    avg_supply_cap = max(float(avg.get("supply_cap", 0.0)), 1.0)
+    avg_supply_util = _clamp(avg_supply_used / avg_supply_cap, 0.0, 1.0)
+    avg_tech = _clamp(avg.get("tech_level", 0.0), 0.0, 2.0) / 2.0
+    avg_army_supply = max(avg_supply_used - float(avg.get("workers", 0.0)), 0.0)
+    avg_army_score = _clamp(avg_army_supply / 100.0, 0.0, 1.0)
+    avg_structures = _clamp(avg.get("structures", 0.0), 0.0, 20.0) / 20.0
 
     mineral_eff = _clamp(eco.get("mineral_collection_efficiency", 0.0), 0.0, 5.0) / 5.0
     idle_worker_rate = _clamp(eco.get("idle_worker_time", 0.0) / time_min, 0.0, 60.0)
@@ -32,6 +44,8 @@ def evaluate_agent(metrics: dict) -> dict:
         mineral_eff * 40.0
         + (1.0 - idle_worker_rate / 60.0) * 30.0
         + (1.0 - idle_prod_rate / 60.0) * 30.0
+        + avg_income * 10.0
+        + avg_workers * 5.0
     )
 
     damage_ratio = _clamp(mil.get("damage_ratio", 0.0), 0.0, 3.0) / 3.0
@@ -43,16 +57,27 @@ def evaluate_agent(metrics: dict) -> dict:
         damage_ratio * 40.0
         + kill_value_ratio * 40.0
         + damage_rate_score * 20.0
+        + avg_army_score * 10.0
     )
 
     spending_rate = _clamp(res.get("resource_spending_rate", 0.0), 0.0, 1.2) / 1.2
     retained_score = _saturating_score(prod.get("net_value_retained", 0.0), 4000.0)
-    macro_pts = spending_rate * 60.0 + retained_score * 40.0
+    macro_pts = (
+        spending_rate * 60.0
+        + retained_score * 40.0
+        + avg_supply_util * 5.0
+        + avg_tech * 10.0
+    )
 
     created_score = _saturating_score(prod.get("total_value_created", 0.0), 5000.0)
     structure_score = _saturating_score(prod.get("total_structure_value", 0.0), 1500.0)
     loss_penalty = _clamp(prod.get("value_lost_structures", 0.0) / 2000.0, 0.0, 1.0)
-    prod_pts = created_score * 45.0 + structure_score * 35.0 + (1.0 - loss_penalty) * 20.0
+    prod_pts = (
+        created_score * 45.0
+        + structure_score * 35.0
+        + (1.0 - loss_penalty) * 20.0
+        + avg_structures * 5.0
+    )
 
     scores = {
         "economic_score": round(_clamp(eco_pts, 0.0, 100.0), 2),
@@ -103,34 +128,86 @@ def plot_radar_chart(scores: dict, output_path: str = "performance_radar.png"):
     plt.close()
 
 class MLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, n_layers, act=nn.SiLU, optimizer = "Adam", lr=0.001):
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim,
+        output_dim,
+        n_layers,
+        act=nn.ReLU,
+        layer_norm: bool = False,
+        init_orthogonal: bool = False,
+        output_gain: float = 1.0,
+        hidden_gain: float | None = None,
+    ):
         super(MLP, self).__init__()
         assert n_layers >= 2, "MLP must have at least two layers"
+        if hidden_gain is None:
+            hidden_gain = math.sqrt(2.0)
+
         layers = []
-        layers.append(nn.Linear(input_dim, hidden_dim))
-        for _ in range(n_layers - 2):
-            layers.append(act(inplace=True))
-            layers.append(nn.Linear(hidden_dim, hidden_dim))
-        layers.append(act(inplace=True))
-        layers.append(nn.Linear(hidden_dim, output_dim))
+        in_dim = input_dim
+        for layer_idx in range(n_layers):
+            out_dim = output_dim if layer_idx == n_layers - 1 else hidden_dim
+            layers.append(nn.Linear(in_dim, out_dim))
+            if layer_idx != n_layers - 1:
+                if layer_norm:
+                    layers.append(nn.LayerNorm(out_dim))
+                layers.append(act())
+            in_dim = out_dim
+
         self.model = nn.Sequential(*layers)
-        match optimizer:
-            case "Adam":
-                self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
-            case "SGD":
-                self.optimizer = torch.optim.SGD(self.parameters(), lr=lr)
-            case _:
-                raise ValueError(f"Unsupported optimizer: {optimizer}")
+
+        if init_orthogonal:
+            linears = [m for m in self.model if isinstance(m, nn.Linear)]
+            last_idx = len(linears) - 1
+            for idx, layer in enumerate(linears):
+                gain = output_gain if idx == last_idx else hidden_gain
+                nn.init.orthogonal_(layer.weight, gain)
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
 
     def forward(self, x):
         return self.model(x)
+
+class RunningMeanStd:
+    def __init__(self, epsilon: float = 1e-4):
+        self.mean = torch.zeros((), dtype=torch.float64)
+        self.var = torch.ones((), dtype=torch.float64)
+        self.count = float(epsilon)
+
+    def update(self, x: torch.Tensor):
+        if x.numel() == 0:
+            return
+        x = x.detach().to(dtype=torch.float64, device="cpu")
+        batch_mean = x.mean()
+        batch_var = x.var(unbiased=False)
+        batch_count = x.numel()
+        self._update_from_moments(batch_mean, batch_var, batch_count)
+
+    def _update_from_moments(self, batch_mean, batch_var, batch_count):
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+        new_mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + delta * delta * self.count * batch_count / total_count
+        new_var = m2 / total_count
+        self.mean = new_mean
+        self.var = new_var
+        self.count = float(total_count)
+
+    def normalize(self, x: torch.Tensor, eps: float = 1e-8):
+        mean = self.mean.to(dtype=x.dtype, device=x.device)
+        var = self.var.to(dtype=x.dtype, device=x.device)
+        return (x - mean) / torch.sqrt(var + eps)
 
 class ResBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(ResBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(out_channels)
-        self.act = nn.SiLU(inplace=True)
+        self.act = nn.SiLU()
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm2d(out_channels)
 
@@ -150,7 +227,7 @@ class ImageFeatureExtractor(nn.Module):
         super(ImageFeatureExtractor, self).__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(out_channels)
-        self.act = nn.SiLU(inplace=True)
+        self.act = nn.SiLU()
         self.resblock1 = ResBlock(out_channels, out_channels)
         self.resblock2 = ResBlock(out_channels, out_channels)
         self.resblock3 = ResBlock(out_channels, out_channels)
@@ -188,8 +265,8 @@ class DiscreteHead(nn.Module):
         logits = self.linear(x)
         dist = Categorical(logits=logits)
         sample = dist.sample()
-        logit = dist.log_prob(sample)
-        return sample, logit
+        log_probs = dist.log_prob(sample)
+        return sample, log_probs
 
 class MultiBinaryHead(nn.Module):
     def __init__(self, input_dim, output_dim):
@@ -203,3 +280,103 @@ class MultiBinaryHead(nn.Module):
         log_prob = dist.log_prob(sample)
 
         return sample, log_prob
+
+class EntityEncoder(nn.Module):
+    def __init__(self, input_dim, d_model=128, n_heads=4, n_layers=2):
+        super().__init__()
+
+        self.input_proj = nn.Linear(input_dim, d_model)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            batch_first=True
+        )
+
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=n_layers,
+            enable_nested_tensor=False,
+        )
+
+    def forward(self, x, mask):
+
+        x = self.input_proj(x)
+
+        key_padding_mask = (mask == 0)
+
+        x = self.transformer(x, src_key_padding_mask=key_padding_mask)
+
+        mask = mask.unsqueeze(-1)
+        x = x * mask
+
+        pooled = x.sum(dim=1) / (mask.sum(dim=1) + 1e-6)
+
+        return pooled
+    
+class RolloutBuffer:
+    def __init__(self, device: str | torch.device = "cpu"):
+        self.device = torch.device(device)
+        self.reset()
+
+    def reset(self):
+        self.images = []
+        self.resources = []
+        self.entities = []
+        self.masks = []
+        self.action_masks = []
+
+        self.actions = []
+        self.log_probs = []
+        self.rewards = []
+        self.dones = []
+        self.values = []
+
+        self.h_states = []
+        self.c_states = []
+
+    def add(self, obs, action, log_prob, reward, done, value, lstm_state, action_mask=None):
+        img, res, ent, mask = obs
+        self.images.append(torch.as_tensor(img, dtype=torch.float16, device=self.device))
+        self.resources.append(torch.as_tensor(res, dtype=torch.float16, device=self.device))
+        self.entities.append(torch.as_tensor(ent, dtype=torch.float16, device=self.device))
+        self.masks.append(torch.as_tensor(mask, dtype=torch.float16, device=self.device))
+        if action_mask is not None:
+            self.action_masks.append(torch.as_tensor(action_mask, dtype=torch.bool, device=self.device))
+
+        self.actions.append(torch.as_tensor(action, dtype=torch.long, device=self.device))
+        self.log_probs.append(log_prob.detach().to(self.device))
+        self.rewards.append(torch.as_tensor(reward, dtype=torch.float32, device=self.device))
+        self.dones.append(torch.as_tensor(done, dtype=torch.float32, device=self.device))
+        self.values.append(value.detach().to(self.device))
+
+        h, c = lstm_state
+        self.h_states.append(h.detach().to(self.device).squeeze(0))
+        self.c_states.append(c.detach().to(self.device).squeeze(0))
+
+class CrossAttentionFusion(nn.Module):
+    def __init__(self, image_dim, resource_dim, entity_dim, fusion_dim, n_heads):
+        super().__init__()
+        self.image_proj = nn.Linear(image_dim, fusion_dim)
+        self.resource_proj = nn.Linear(resource_dim, fusion_dim)
+        self.entity_proj = nn.Linear(entity_dim, fusion_dim)
+        self.fusion_token = nn.Parameter(torch.zeros(1, 1, fusion_dim))
+        self.attn = nn.MultiheadAttention(
+            fusion_dim,
+            n_heads,
+            batch_first=True,
+        )
+        nn.init.normal_(self.fusion_token, mean=0.0, std=0.02)
+
+    def forward(self, image_features, resource_features, entity_features):
+        tokens = torch.stack(
+            [
+                self.image_proj(image_features),
+                self.resource_proj(resource_features),
+                self.entity_proj(entity_features),
+            ],
+            dim=1,
+        )
+        query = self.fusion_token.expand(tokens.size(0), -1, -1)
+        attn_out, _ = self.attn(query, tokens, tokens, need_weights=False)
+        return (query + attn_out).squeeze(1)
